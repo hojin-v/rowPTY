@@ -85,6 +85,7 @@ internal sealed class RowPty
     private int fetchMaxWidth;
 
     private Stopwatch clock;
+    private bool childOutputSeen;
     private bool screenDirty;
     private long lastOutputMs;
     private int forceRepaintCount;
@@ -522,7 +523,7 @@ internal sealed class RowPty
 
     private int RunMainLoop()
     {
-        bool forcePaint = true;
+        bool forcePaint = false;
         long nextSizeCheckMs = 0;
         long nextFetchMs = 0;
         long intervalMs = (long)(this.options.IntervalSeconds * 1000.0);
@@ -539,6 +540,11 @@ internal sealed class RowPty
             }
 
             long nowMs = this.clock.ElapsedMilliseconds;
+            bool childOutputSeenNow;
+            lock (this.stateLock)
+            {
+                childOutputSeenNow = this.childOutputSeen;
+            }
 
             if (nowMs >= nextSizeCheckMs)
             {
@@ -551,14 +557,17 @@ internal sealed class RowPty
                         this.currentCols = cols;
                         this.currentRows = rows;
                         this.resizePseudoConsoleProvider(this.hPseudoConsole, MakeSize(cols, ChildRows(rows)));
-                        RequestStatusFetch(MaxStatusWidth(cols));
-                        forcePaint = true;
+                        if (childOutputSeenNow)
+                        {
+                            RequestStatusFetch(MaxStatusWidth(cols));
+                            forcePaint = true;
+                        }
                     }
                 }
                 nextSizeCheckMs = nowMs + 200;
             }
 
-            if (this.options.StatusCommand != null && nowMs >= nextFetchMs)
+            if (childOutputSeenNow && this.options.StatusCommand != null && nowMs >= nextFetchMs)
             {
                 RequestStatusFetch(MaxStatusWidth(this.currentCols));
                 nextFetchMs = nowMs + intervalMs;
@@ -576,7 +585,11 @@ internal sealed class RowPty
 
             lock (this.stateLock)
             {
-                if (this.forceRepaintCount > 0)
+                if (!this.childOutputSeen)
+                {
+                    paintNow = false;
+                }
+                else if (this.forceRepaintCount > 0)
                 {
                     paintNow = true;
                     forced = true;
@@ -599,7 +612,7 @@ internal sealed class RowPty
                     }
                 }
 
-                if (!paintNow && version != this.paintedStatusVersion)
+                if (this.childOutputSeen && !paintNow && version != this.paintedStatusVersion)
                 {
                     paintNow = true;
                 }
@@ -817,9 +830,11 @@ internal sealed class RowPty
                 break;
             }
 
+            int currentVtState = this.outputVtState;
             bool clearSeen = ScanForClear(buffer, read);
+            bool visibleTextSeen = ScanForVisibleText(currentVtState, buffer, read);
             int win32InputModeChange = ScanForWin32InputMode(buffer, read);
-            int nextVtState = ScanVtState(this.outputVtState, buffer, read);
+            int nextVtState = ScanVtState(currentVtState, buffer, read);
             if (win32InputModeChange > 0)
             {
                 this.win32InputModeEnabled = true;
@@ -843,6 +858,10 @@ internal sealed class RowPty
                     {
                         this.outputVtState = nextVtState;
                         this.outputVtStateChangedMs = nowMs;
+                    }
+                    if (visibleTextSeen)
+                    {
+                        this.childOutputSeen = true;
                     }
                     this.lastOutputMs = nowMs;
                     this.screenDirty = true;
@@ -1506,6 +1525,86 @@ internal sealed class RowPty
             }
         }
         return state;
+    }
+
+    private static bool ScanForVisibleText(int state, byte[] buffer, int count)
+    {
+        int i;
+        for (i = 0; i < count; i++)
+        {
+            byte b = buffer[i];
+            if (state == VT_STATE_GROUND)
+            {
+                if (b == 27)
+                {
+                    state = VT_STATE_ESC;
+                }
+                else if (b > 0x20 && b != 0x7f)
+                {
+                    return true;
+                }
+            }
+            else if (state == VT_STATE_ESC)
+            {
+                state = VtEscTransition(b);
+            }
+            else if (state == VT_STATE_CSI)
+            {
+                if (b >= 0x40 && b <= 0x7e)
+                {
+                    state = VT_STATE_GROUND;
+                }
+            }
+            else if (state == VT_STATE_OSC)
+            {
+                if (b == 7)
+                {
+                    state = VT_STATE_GROUND;
+                }
+                else if (b == 27)
+                {
+                    state = VT_STATE_OSC_ESC;
+                }
+            }
+            else if (state == VT_STATE_DCS)
+            {
+                if (b == 7)
+                {
+                    state = VT_STATE_GROUND;
+                }
+                else if (b == 27)
+                {
+                    state = VT_STATE_DCS_ESC;
+                }
+            }
+            else if (state == VT_STATE_OSC_ESC)
+            {
+                if (b == (byte)'\\')
+                {
+                    state = VT_STATE_GROUND;
+                }
+                else
+                {
+                    state = VtEscTransition(b);
+                }
+            }
+            else if (state == VT_STATE_DCS_ESC)
+            {
+                if (b == (byte)'\\')
+                {
+                    state = VT_STATE_GROUND;
+                }
+                else
+                {
+                    state = VtEscTransition(b);
+                }
+            }
+            else
+            {
+                state = VT_STATE_GROUND;
+            }
+        }
+        return false;
     }
 
     private static int VtEscTransition(byte b)

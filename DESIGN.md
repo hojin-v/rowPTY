@@ -1,4 +1,4 @@
-# rowpty — Windows ConPTY host with a reserved status row
+# WrowPTY — Windows ConPTY host with a reserved status row
 
 ## Problem
 

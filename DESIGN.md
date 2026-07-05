@@ -82,9 +82,25 @@ child process attached to the ConPTY, believes terminal is rows-N tall
    (bytes flow to the child instead); for CTRL_CLOSE_EVENT run Cleanup and
    return FALSE.
 4. Read size via `GetConsoleScreenBufferInfo` (srWindow width/height, min 20x4).
-5. Create two pipe pairs (`CreatePipe`, default security, 0 size), then
-   `CreatePseudoConsole({cols, rows-N}, inRead, outWrite, 0, out hPC)`. Close
-   the child-side handles (inRead, outWrite) in the parent after creation.
+5. Create two pipe pairs (`CreatePipe`, default security, 0 size), then create
+   the pseudo console sized {cols, rows-N} and close the child-side handles
+   (inRead, outWrite) in the parent after creation.
+
+   **ConPTY provider selection**: the in-box conhost's ConPTY re-renders
+   scroll-region-heavy TUI output (ratatui/Codex history insertion) as viewport
+   repaints — live symptom: streamed responses invisible, screen corruption,
+   scrollback lost. Windows Terminal 1.22's ConPTY (shipped as `conpty.dll` +
+   `OpenConsole.exe`, MIT, redistributed by node-pty the same way) passes VT
+   through faithfully. So:
+   - If `conpty.dll` exists next to rowpty.exe (or at `%ROWPTY_CONPTY_DLL%`;
+     `ROWPTY_NO_CONPTY_DLL=1` disables), `LoadLibraryW` it and resolve
+     `ConptyCreatePseudoConsole`, `ConptyResizePseudoConsole`,
+     `ConptyClosePseudoConsole` via `GetProcAddress` (same signatures as the
+     kernel32 counterparts). `OpenConsole.exe` must sit in the same directory —
+     conpty.dll spawns it as the console host.
+   - Otherwise fall back to kernel32 `CreatePseudoConsole` / `ResizePseudoConsole`
+     / `ClosePseudoConsole`.
+   - All later resize/close calls must go through the same provider.
 6. `STARTUPINFOEX` + `InitializeProcThreadAttributeList` (1 attribute) +
    `UpdateProcThreadAttribute(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016, hPC)`
    + `CreateProcess(NULL, cmdline, ..., EXTENDED_STARTUPINFO_PRESENT, NULL env,
@@ -149,6 +165,11 @@ Every 50 ms tick:
    - else if `screenDirty` and `now - lastPaint >= 750 ms` → paint anyway
      (child streaming continuously), clear dirty;
    - else if status text changed since last paint → paint.
+4b. **Ground-state gating**: a paint injected between two output chunks that
+   split an escape sequence corrupts the child's output. OutputPump therefore
+   tracks a minimal VT parser state across chunks (Ground / Esc / CSI / OSC /
+   DCS; OSC and DCS end at BEL or ST `ESC \`), and the painter skips its turn
+   (retries next 50 ms tick) whenever the stream is not in Ground state.
 5. Paint = under `lock(ConsoleLock)` write UTF-8 bytes of:
    `ESC 7  ESC [0m  ESC [{row};1H  ESC [1G  {line}  ESC [K  ESC [0m  ESC 8`
    where `row = rows` (the real bottom row; with --reserve 2 the extra rows

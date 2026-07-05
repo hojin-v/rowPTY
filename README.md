@@ -29,6 +29,8 @@ WSL/Linux/macOS에서는 POSIX PTY로 "자식에게 화면을 한 줄 짧게 알
 | Lock-serialized writes | 출력 펌프와 페인터가 단일 프로세스에서 직렬화되어 이스케이프 시퀀스가 끊기지 않습니다 |
 | Status command | 임의의 명령을 주기 실행해 stdout을 상태줄로 표시, `{MAXWIDTH}` 토큰으로 가용 폭 전달 |
 | Resize / clear-screen 대응 | 창 크기 변화를 감지해 ConPTY를 리사이즈하고, 화면 클리어 시퀀스 후 상태줄을 복구합니다 |
+| 최신 ConPTY 번들 | exe 옆의 `conpty.dll`(Windows Terminal의 passthrough ConPTY)을 자동 로드해 스크롤 영역 기반 TUI 출력(스트리밍 응답, 히스토리 삽입)을 원형 그대로 전달합니다. 없으면 OS 내장 ConPTY로 폴백, `ROWPTY_NO_CONPTY_DLL=1`로 비활성화 |
+| Paint 안전 지점 판정 | 출력 스트림의 VT 파서 상태를 추적해 이스케이프 시퀀스 중간에는 상태줄을 그리지 않습니다 (2초 기아 방지 탈출 포함) |
 | Exit-code passthrough | 자식의 종료 코드를 그대로 반환합니다 |
 
 ## Quick Start
@@ -42,9 +44,11 @@ WSL/Linux/macOS에서는 POSIX PTY로 "자식에게 화면을 한 줄 짧게 알
    ```
    rowpty.exe --interval 10 --status-cmd "cmd /d /c echo width={MAXWIDTH}" -- codex
    ```
-4. ai-battery와 함께 쓰려면 exe를 검색 경로에 복사합니다:
+4. ai-battery와 함께 쓰려면 exe와 번들 ConPTY를 검색 경로에 복사합니다:
    ```
-   copy bin\rowpty.exe %LOCALAPPDATA%\ai-battery\bin\rowpty.exe
+   copy bin\rowpty.exe %LOCALAPPDATA%\ai-battery\bin\
+   copy bin\conpty.dll %LOCALAPPDATA%\ai-battery\bin\
+   copy bin\OpenConsole.exe %LOCALAPPDATA%\ai-battery\bin\
    ```
    또는 환경변수 `AI_BATTERY_ROWPTY`에 exe 경로를 지정합니다. 이후 `codex`를 실행하면 ai-battery runner가 rowpty를 자동으로 사용합니다 (`ai-battery doctor`로 인식 여부 확인).
 
@@ -92,7 +96,7 @@ Windows Terminal / conhost  (실제 콘솔, UTF-8 + VT 모드)
 
 | Layer | Technology | Role |
 | --- | --- | --- |
-| PTY | Win32 ConPTY (`CreatePseudoConsole`) | 자식을 `rows - N` 크기 가상 콘솔에 연결 |
+| PTY | Windows Terminal `conpty.dll` (번들, [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)) → 폴백 Win32 `CreatePseudoConsole` | 자식을 `rows - N` 크기 가상 콘솔에 연결, passthrough 렌더링 |
 | Input | `ReadConsoleInputW` + win32-input-mode | 키 이벤트 무손실 전달 |
 | Output | pipe → `WriteFile` 단일 홉 | 릴레이 계층 없이 콘솔에 직접 출력 |
 | Language | C# 5, .NET Framework 4.8 | 모든 Windows 10/11에 런타임 내장 |

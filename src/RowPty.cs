@@ -33,6 +33,14 @@ internal sealed class RowPty
     private const uint CTRL_BREAK_EVENT = 1;
     private const uint CTRL_CLOSE_EVENT = 2;
 
+    private const int VT_STATE_GROUND = 0;
+    private const int VT_STATE_ESC = 1;
+    private const int VT_STATE_CSI = 2;
+    private const int VT_STATE_OSC = 3;
+    private const int VT_STATE_DCS = 4;
+    private const int VT_STATE_OSC_ESC = 5;
+    private const int VT_STATE_DCS_ESC = 6;
+
     private static readonly ConsoleCtrlDelegate CtrlDelegate = new ConsoleCtrlDelegate(ConsoleCtrlHandler);
     private static RowPty activeInstance;
 
@@ -60,6 +68,10 @@ internal sealed class RowPty
     private IntPtr conptyOutWrite = IntPtr.Zero;
     private IntPtr attributeList = IntPtr.Zero;
     private IntPtr childProcessHandle = IntPtr.Zero;
+    private IntPtr conptyProviderLibrary = IntPtr.Zero;
+    private CreatePseudoConsoleDelegate createPseudoConsoleProvider = new CreatePseudoConsoleDelegate(KernelCreatePseudoConsole);
+    private ResizePseudoConsoleDelegate resizePseudoConsoleProvider = new ResizePseudoConsoleDelegate(KernelResizePseudoConsole);
+    private ClosePseudoConsoleDelegate closePseudoConsoleProvider = new ClosePseudoConsoleDelegate(KernelClosePseudoConsole);
 
     private Thread inputThread;
     private Thread outputThread;
@@ -76,6 +88,8 @@ internal sealed class RowPty
     private bool screenDirty;
     private long lastOutputMs;
     private int forceRepaintCount;
+    private volatile int outputVtState = VT_STATE_GROUND;
+    private long outputVtStateChangedMs;
 
     private string statusText = "";
     private int statusVersion;
@@ -124,11 +138,13 @@ internal sealed class RowPty
         }
 
         this.clock = Stopwatch.StartNew();
+        this.outputVtStateChangedMs = this.clock.ElapsedMilliseconds;
         SetupConsole();
         if (!ReadConsoleSize(out this.currentCols, out this.currentRows))
         {
             throw new Win32Exception(Marshal.GetLastWin32Error(), "GetConsoleScreenBufferInfo failed");
         }
+        ResolveConptyProvider();
         CreatePseudoConsoleAndChild();
         StartThreads();
 
@@ -314,6 +330,107 @@ internal sealed class RowPty
         SetConsoleOutputCP(65001);
     }
 
+    private void ResolveConptyProvider()
+    {
+        SetKernel32ConptyProvider();
+
+        string disabled = Environment.GetEnvironmentVariable("ROWPTY_NO_CONPTY_DLL");
+        if (string.Equals(disabled, "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        string dllPath = Environment.GetEnvironmentVariable("ROWPTY_CONPTY_DLL");
+        if (dllPath == null || dllPath.Length == 0)
+        {
+            dllPath = FindBundledConptyDll();
+        }
+        if (dllPath == null || dllPath.Length == 0)
+        {
+            return;
+        }
+
+        TryLoadConptyProvider(dllPath);
+    }
+
+    private void SetKernel32ConptyProvider()
+    {
+        this.createPseudoConsoleProvider = new CreatePseudoConsoleDelegate(KernelCreatePseudoConsole);
+        this.resizePseudoConsoleProvider = new ResizePseudoConsoleDelegate(KernelResizePseudoConsole);
+        this.closePseudoConsoleProvider = new ClosePseudoConsoleDelegate(KernelClosePseudoConsole);
+    }
+
+    private static string FindBundledConptyDll()
+    {
+        try
+        {
+            Process process = Process.GetCurrentProcess();
+            ProcessModule module = process.MainModule;
+            if (module == null || module.FileName == null || module.FileName.Length == 0)
+            {
+                return null;
+            }
+
+            string directory = Path.GetDirectoryName(module.FileName);
+            if (directory == null || directory.Length == 0)
+            {
+                return null;
+            }
+
+            string candidate = Path.Combine(directory, "conpty.dll");
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+        catch (Exception)
+        {
+        }
+        return null;
+    }
+
+    private void TryLoadConptyProvider(string dllPath)
+    {
+        IntPtr library = IntPtr.Zero;
+        try
+        {
+            library = LoadLibraryW(dllPath);
+            if (library == IntPtr.Zero)
+            {
+                return;
+            }
+
+            IntPtr createProc = GetProcAddress(library, "ConptyCreatePseudoConsole");
+            IntPtr resizeProc = GetProcAddress(library, "ConptyResizePseudoConsole");
+            IntPtr closeProc = GetProcAddress(library, "ConptyClosePseudoConsole");
+            if (createProc == IntPtr.Zero || resizeProc == IntPtr.Zero || closeProc == IntPtr.Zero)
+            {
+                return;
+            }
+
+            CreatePseudoConsoleDelegate createDelegate = (CreatePseudoConsoleDelegate)Marshal.GetDelegateForFunctionPointer(createProc, typeof(CreatePseudoConsoleDelegate));
+            ResizePseudoConsoleDelegate resizeDelegate = (ResizePseudoConsoleDelegate)Marshal.GetDelegateForFunctionPointer(resizeProc, typeof(ResizePseudoConsoleDelegate));
+            ClosePseudoConsoleDelegate closeDelegate = (ClosePseudoConsoleDelegate)Marshal.GetDelegateForFunctionPointer(closeProc, typeof(ClosePseudoConsoleDelegate));
+
+            this.createPseudoConsoleProvider = createDelegate;
+            this.resizePseudoConsoleProvider = resizeDelegate;
+            this.closePseudoConsoleProvider = closeDelegate;
+            this.conptyProviderLibrary = library;
+            library = IntPtr.Zero;
+        }
+        catch (Exception)
+        {
+            SetKernel32ConptyProvider();
+        }
+        finally
+        {
+            if (library != IntPtr.Zero)
+            {
+                FreeLibrary(library);
+            }
+        }
+    }
+
     private void CreatePseudoConsoleAndChild()
     {
         if (!CreatePipe(out this.conptyInRead, out this.conptyInWrite, IntPtr.Zero, 0))
@@ -326,7 +443,7 @@ internal sealed class RowPty
         }
 
         COORD size = MakeSize(this.currentCols, ChildRows(this.currentRows));
-        int hr = CreatePseudoConsole(size, this.conptyInRead, this.conptyOutWrite, 0, out this.hPseudoConsole);
+        int hr = this.createPseudoConsoleProvider(size, this.conptyInRead, this.conptyOutWrite, 0, out this.hPseudoConsole);
         if (hr < 0)
         {
             Marshal.ThrowExceptionForHR(hr);
@@ -433,7 +550,7 @@ internal sealed class RowPty
                     {
                         this.currentCols = cols;
                         this.currentRows = rows;
-                        ResizePseudoConsole(this.hPseudoConsole, MakeSize(cols, ChildRows(rows)));
+                        this.resizePseudoConsoleProvider(this.hPseudoConsole, MakeSize(cols, ChildRows(rows)));
                         RequestStatusFetch(MaxStatusWidth(cols));
                         forcePaint = true;
                     }
@@ -450,6 +567,13 @@ internal sealed class RowPty
             bool paintNow = forcePaint;
             bool forced = forcePaint;
             bool clearDirty = false;
+            bool consumeForceRepaint = false;
+            int version;
+            lock (this.statusLock)
+            {
+                version = this.statusVersion;
+            }
+
             lock (this.stateLock)
             {
                 if (this.forceRepaintCount > 0)
@@ -457,7 +581,7 @@ internal sealed class RowPty
                     paintNow = true;
                     forced = true;
                     clearDirty = true;
-                    this.forceRepaintCount--;
+                    consumeForceRepaint = true;
                 }
                 else if (this.screenDirty)
                 {
@@ -473,26 +597,18 @@ internal sealed class RowPty
                     }
                 }
 
-                if (clearDirty)
+                if (!paintNow && version != this.paintedStatusVersion)
                 {
-                    this.screenDirty = false;
+                    paintNow = true;
                 }
-            }
-
-            int version;
-            lock (this.statusLock)
-            {
-                version = this.statusVersion;
-            }
-            if (!paintNow && version != this.paintedStatusVersion)
-            {
-                paintNow = true;
             }
 
             if (paintNow)
             {
-                PaintStatus(forced);
-                forcePaint = false;
+                if (PaintStatus(forced, clearDirty, consumeForceRepaint, nowMs))
+                {
+                    forcePaint = false;
+                }
             }
 
             Thread.Sleep(50);
@@ -532,6 +648,11 @@ internal sealed class RowPty
 
                 if (this.win32InputModeEnabled)
                 {
+                    if (TryDropTerminalResponse(records, read, ref i))
+                    {
+                        continue;
+                    }
+
                     byte[] sequence = EncodeWin32InputMode(key);
                     if (!WriteAll(this.conptyInWrite, sequence, sequence.Length))
                     {
@@ -548,6 +669,65 @@ internal sealed class RowPty
                 }
             }
         }
+    }
+
+    private static bool TryDropTerminalResponse(INPUT_RECORD[] records, uint read, ref uint index)
+    {
+        char ch;
+        if (!TryGetKeyDownChar(records[index], out ch) || ch != (char)27)
+        {
+            return false;
+        }
+
+        uint j = index + 1;
+        if (j >= read || !TryGetKeyDownChar(records[j], out ch) || ch != '[')
+        {
+            return false;
+        }
+
+        StringBuilder builder = new StringBuilder(64);
+        builder.Append((char)27);
+        builder.Append('[');
+        j++;
+
+        while (j < read && builder.Length < 64)
+        {
+            if (!TryGetKeyDownChar(records[j], out ch))
+            {
+                return false;
+            }
+            builder.Append(ch);
+
+            if (ch == 'c' || ch == 'R' || ch == 't')
+            {
+                index = j;
+                return true;
+            }
+
+            if (!((ch >= '0' && ch <= '?') || ch == ';'))
+            {
+                return false;
+            }
+            j++;
+        }
+
+        return false;
+    }
+
+    private static bool TryGetKeyDownChar(INPUT_RECORD record, out char ch)
+    {
+        ch = (char)0;
+        if (record.EventType != KEY_EVENT)
+        {
+            return false;
+        }
+        KEY_EVENT_RECORD key = record.KeyEvent;
+        if (key.bKeyDown == 0 || key.UnicodeChar == (char)0)
+        {
+            return false;
+        }
+        ch = key.UnicodeChar;
+        return true;
     }
 
     private static void RepairKeyEvent(ref KEY_EVENT_RECORD key)
@@ -637,6 +817,7 @@ internal sealed class RowPty
 
             bool clearSeen = ScanForClear(buffer, read);
             int win32InputModeChange = ScanForWin32InputMode(buffer, read);
+            int nextVtState = ScanVtState(this.outputVtState, buffer, read);
             if (win32InputModeChange > 0)
             {
                 this.win32InputModeEnabled = true;
@@ -652,15 +833,21 @@ internal sealed class RowPty
                 {
                     break;
                 }
-            }
 
-            lock (this.stateLock)
-            {
-                this.lastOutputMs = this.clock.ElapsedMilliseconds;
-                this.screenDirty = true;
-                if (clearSeen)
+                lock (this.stateLock)
                 {
-                    this.forceRepaintCount = 3;
+                    long nowMs = this.clock.ElapsedMilliseconds;
+                    if (nextVtState != this.outputVtState)
+                    {
+                        this.outputVtState = nextVtState;
+                        this.outputVtStateChangedMs = nowMs;
+                    }
+                    this.lastOutputMs = nowMs;
+                    this.screenDirty = true;
+                    if (clearSeen)
+                    {
+                        this.forceRepaintCount = 3;
+                    }
                 }
             }
         }
@@ -813,7 +1000,7 @@ internal sealed class RowPty
         this.fetchEvent.Set();
     }
 
-    private void PaintStatus(bool forced)
+    private bool PaintStatus(bool forced, bool clearDirty, bool consumeForceRepaint, long nowMs)
     {
         string text;
         int version;
@@ -831,24 +1018,45 @@ internal sealed class RowPty
         }
 
         string line = FitStatusLine(text, width);
-        if (!forced && this.lastPaintedLine != null && this.lastPaintedRow == row && this.lastPaintedLine == line)
+        string sequence = null;
+        byte[] bytes = null;
+        bool needsWrite = forced || this.lastPaintedLine == null || this.lastPaintedRow != row || this.lastPaintedLine != line;
+        if (needsWrite)
         {
-            this.paintedStatusVersion = version;
-            this.lastPaintMs = this.clock.ElapsedMilliseconds;
-            return;
+            sequence = "\u001b7\u001b[0m\u001b[" + row.ToString(CultureInfo.InvariantCulture) + ";1H\u001b[1G" + line + "\u001b[K\u001b[0m\u001b8";
+            bytes = Encoding.UTF8.GetBytes(sequence);
         }
 
-        string sequence = "\u001b7\u001b[0m\u001b[" + row.ToString(CultureInfo.InvariantCulture) + ";1H\u001b[1G" + line + "\u001b[K\u001b[0m\u001b8";
-        byte[] bytes = Encoding.UTF8.GetBytes(sequence);
         lock (this.consoleLock)
         {
-            WriteAll(this.hStdOut, bytes, bytes.Length);
+            lock (this.stateLock)
+            {
+                if (!CanPaintWithVtStateLocked(nowMs))
+                {
+                    return false;
+                }
+
+                if (consumeForceRepaint && this.forceRepaintCount > 0)
+                {
+                    this.forceRepaintCount--;
+                }
+                if (clearDirty)
+                {
+                    this.screenDirty = false;
+                }
+            }
+
+            if (needsWrite)
+            {
+                WriteAll(this.hStdOut, bytes, bytes.Length);
+            }
         }
 
         this.lastPaintedLine = line;
         this.lastPaintedRow = row;
         this.paintedStatusVersion = version;
         this.lastPaintMs = this.clock.ElapsedMilliseconds;
+        return true;
     }
 
     private static string FitStatusLine(string text, int width)
@@ -1214,6 +1422,108 @@ internal sealed class RowPty
         return mode;
     }
 
+    private static int ScanVtState(int state, byte[] buffer, int count)
+    {
+        int i;
+        for (i = 0; i < count; i++)
+        {
+            byte b = buffer[i];
+            if (state == VT_STATE_GROUND)
+            {
+                if (b == 27)
+                {
+                    state = VT_STATE_ESC;
+                }
+            }
+            else if (state == VT_STATE_ESC)
+            {
+                state = VtEscTransition(b);
+            }
+            else if (state == VT_STATE_CSI)
+            {
+                if (b >= 0x40 && b <= 0x7e)
+                {
+                    state = VT_STATE_GROUND;
+                }
+            }
+            else if (state == VT_STATE_OSC)
+            {
+                if (b == 7)
+                {
+                    state = VT_STATE_GROUND;
+                }
+                else if (b == 27)
+                {
+                    state = VT_STATE_OSC_ESC;
+                }
+            }
+            else if (state == VT_STATE_DCS)
+            {
+                if (b == 7)
+                {
+                    state = VT_STATE_GROUND;
+                }
+                else if (b == 27)
+                {
+                    state = VT_STATE_DCS_ESC;
+                }
+            }
+            else if (state == VT_STATE_OSC_ESC)
+            {
+                if (b == (byte)'\\')
+                {
+                    state = VT_STATE_GROUND;
+                }
+                else
+                {
+                    state = VtEscTransition(b);
+                }
+            }
+            else if (state == VT_STATE_DCS_ESC)
+            {
+                if (b == (byte)'\\')
+                {
+                    state = VT_STATE_GROUND;
+                }
+                else
+                {
+                    state = VtEscTransition(b);
+                }
+            }
+            else
+            {
+                state = VT_STATE_GROUND;
+            }
+        }
+        return state;
+    }
+
+    private static int VtEscTransition(byte b)
+    {
+        if (b == (byte)'[')
+        {
+            return VT_STATE_CSI;
+        }
+        if (b == (byte)']')
+        {
+            return VT_STATE_OSC;
+        }
+        if (b == (byte)'P' || b == (byte)'X' || b == (byte)'^' || b == (byte)'_')
+        {
+            return VT_STATE_DCS;
+        }
+        return VT_STATE_GROUND;
+    }
+
+    private bool CanPaintWithVtStateLocked(long nowMs)
+    {
+        if (this.outputVtState == VT_STATE_GROUND)
+        {
+            return true;
+        }
+        return nowMs - this.outputVtStateChangedMs >= 2000;
+    }
+
     private static bool WriteAll(IntPtr handle, byte[] buffer, int count)
     {
         int offset = 0;
@@ -1285,7 +1595,7 @@ internal sealed class RowPty
 
         if (this.hPseudoConsole != IntPtr.Zero)
         {
-            ClosePseudoConsole(this.hPseudoConsole);
+            this.closePseudoConsoleProvider(this.hPseudoConsole);
             this.hPseudoConsole = IntPtr.Zero;
         }
 
@@ -1332,6 +1642,12 @@ internal sealed class RowPty
         {
             this.fetchEvent.Close();
             this.fetchEvent = null;
+        }
+
+        if (this.conptyProviderLibrary != IntPtr.Zero)
+        {
+            FreeLibrary(this.conptyProviderLibrary);
+            this.conptyProviderLibrary = IntPtr.Zero;
         }
     }
 
@@ -1400,6 +1716,15 @@ internal sealed class RowPty
     }
 
     private delegate bool ConsoleCtrlDelegate(uint ctrlType);
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    private delegate int CreatePseudoConsoleDelegate(COORD size, IntPtr hInput, IntPtr hOutput, uint dwFlags, out IntPtr phPC);
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    private delegate int ResizePseudoConsoleDelegate(IntPtr hPC, COORD size);
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    private delegate void ClosePseudoConsoleDelegate(IntPtr hPC);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct COORD
@@ -1531,14 +1856,23 @@ internal sealed class RowPty
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
 
+    [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "CreatePseudoConsole")]
+    private static extern int KernelCreatePseudoConsole(COORD size, IntPtr hInput, IntPtr hOutput, uint dwFlags, out IntPtr phPC);
+
+    [DllImport("kernel32.dll", EntryPoint = "ClosePseudoConsole")]
+    private static extern void KernelClosePseudoConsole(IntPtr hPC);
+
+    [DllImport("kernel32.dll", EntryPoint = "ResizePseudoConsole")]
+    private static extern int KernelResizePseudoConsole(IntPtr hPC, COORD size);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true, EntryPoint = "LoadLibraryW")]
+    private static extern IntPtr LoadLibraryW(string lpFileName);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true, EntryPoint = "GetProcAddress")]
+    private static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+
     [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern int CreatePseudoConsole(COORD size, IntPtr hInput, IntPtr hOutput, uint dwFlags, out IntPtr phPC);
-
-    [DllImport("kernel32.dll")]
-    private static extern void ClosePseudoConsole(IntPtr hPC);
-
-    [DllImport("kernel32.dll")]
-    private static extern int ResizePseudoConsole(IntPtr hPC, COORD size);
+    private static extern bool FreeLibrary(IntPtr hModule);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);

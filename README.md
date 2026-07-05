@@ -1,4 +1,4 @@
-# WrowPTY
+# rowPTY
 
 **Reserved-Row ConPTY Host** — Windows 터미널의 하단 한 줄을 상태줄 전용으로 예약한 채 TUI 프로그램을 실행하는 네이티브 ConPTY 호스트입니다.
 

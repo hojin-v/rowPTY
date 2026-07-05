@@ -61,19 +61,41 @@ function check(name, ok, detail) {
   check("exit code propagates", res.exitCode === 7, "exitCode=" + res.exitCode);
 }
 
-// 2) input bytes reach the child untouched (DEL 0x7f)
+// 2) keys reach a VT-mode child as single keypresses (node/libuv view)
 {
   const res = await runInPty([
     ROWPTY,
     "--",
     process.execPath, path.join(HERE, "keyprobe.js")
-  ], { input: "a\x7f" + "q", inputDelayMs: 1500 });
+  ], { input: "a\r\x7f" + "q", inputDelayMs: 1500 });
   const m = res.out.match(/CODES:([0-9,]*)/);
   check("keyprobe replied", Boolean(m), res.out.slice(-400));
   if (m) {
     const codes = m[1].split(",").filter(Boolean).map(Number);
     check("letter 'a' (97) forwarded", codes.includes(97), m[1]);
-    check("DEL 0x7f (127) forwarded untouched", codes.includes(127), m[1]);
+    check("Enter arrives as CR (13)", codes.includes(13), m[1]);
+    check("Backspace arrives as one key (127 or 8)", codes.includes(127) || codes.includes(8), m[1]);
+  }
+}
+
+// 2b) keys reach a win32-events child (crossterm view: Codex CLI, ratatui apps)
+// Regression test for: forcing ENABLE_VIRTUAL_TERMINAL_INPUT on the inner
+// console broke Enter/Backspace in crossterm TUIs.
+{
+  const { spawnSync } = await import("node:child_process");
+  const probeExe = path.join(HERE, "Win32KeyProbe.exe");
+  const csc = path.join(process.env.WINDIR || "C:\\Windows", "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe");
+  const compile = spawnSync(csc, ["/nologo", "/optimize+", "/out:" + probeExe, path.join(HERE, "Win32KeyProbe.cs")], { encoding: "utf8" });
+  check("win32 key probe compiles", compile.status === 0, (compile.stdout || "") + (compile.stderr || ""));
+
+  if (compile.status === 0) {
+    const res = await runInPty([ROWPTY, "--", probeExe], { input: "\r\x7f" + "q", inputDelayMs: 1500 });
+    const m = res.out.match(/EVENTS:((?:vk=\d+,ch=\d+;)*)/);
+    check("win32 probe replied", Boolean(m) && !res.out.includes("EVENTS:timeout"), res.out.slice(-400));
+    if (m) {
+      check("Enter is a VK_RETURN key event (vk=13)", m[1].includes("vk=13,ch=13;"), m[1]);
+      check("Backspace is a VK_BACK key event (vk=8)", m[1].includes("vk=8,"), m[1]);
+    }
   }
 }
 

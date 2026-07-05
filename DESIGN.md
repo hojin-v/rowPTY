@@ -73,9 +73,9 @@ child process attached to the ConPTY, believes terminal is rows-N tall
 1. `GetStdHandle` in/out. `GetConsoleMode` on both; if either fails → stderr
    message, exit 2.
 2. Save original modes + input/output code pages. Set:
-   - input: `ENABLE_EXTENDED_FLAGS (0x80)` set, and mode =
-     `ENABLE_VIRTUAL_TERMINAL_INPUT (0x200) | ENABLE_EXTENDED_FLAGS`
-     (i.e. line/echo/processed/mouse/quick-edit/insert all off).
+   - input: mode = `ENABLE_EXTENDED_FLAGS (0x80) | ENABLE_WINDOW_INPUT (0x08)`
+     (line/echo/processed/mouse/quick-edit/insert all off; VT input NOT set —
+     rowpty reads win32 INPUT_RECORDs, see InputPump below).
    - output: `ENABLE_PROCESSED_OUTPUT (0x1) | ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x4) | DISABLE_NEWLINE_AUTO_RETURN (0x8)`.
    - `SetConsoleCP(65001)`, `SetConsoleOutputCP(65001)`.
 3. `SetConsoleCtrlHandler`: return TRUE for CTRL_C_EVENT and CTRL_BREAK_EVENT
@@ -91,11 +91,38 @@ child process attached to the ConPTY, believes terminal is rows-N tall
    cwd = current, &siEx, &pi)`. STARTUPINFO.cb = sizeof(STARTUPINFOEX);
    do NOT set STARTF_USESTDHANDLES.
 
-### Threads
+### Input: win32-input-mode forwarding (NOT a byte pump)
 
-- **InputPump** (background thread): loop `ReadFile(hStdIn, buf 4096)` →
-  `WriteFile(conptyInWrite)`. Bytes pass through untouched (0x7f stays 0x7f).
-  On ReadFile/WriteFile failure → exit thread.
+Writing plain VT bytes ("\r", "\x7f") into the ConPTY input pipe makes the
+inner conhost synthesize KEY_EVENTs with `wVirtualKeyCode=0` (verified with
+test/Win32KeyProbe.cs). win32-event consumers — crossterm TUIs such as Codex
+CLI — then cannot recognize Enter (needs vk=13) or Backspace (needs vk=8).
+Windows Terminal itself feeds ConPTY with the **win32-input-mode** protocol
+instead; rowpty must do the same.
+
+- **InputPump** (background thread): loop `ReadConsoleInputW(hStdIn, records)`.
+  For each `KEY_EVENT_RECORD` (both key-down and key-up):
+  - **Repair** events whose `wVirtualKeyCode == 0` but `UnicodeChar != 0`
+    (these appear when rowpty itself runs under a plain-byte feeder):
+    ch 13 → vk 13 (VK_RETURN); ch 8 or 127 → vk 8 (VK_BACK) with ch forced
+    to 8; ch 9 → vk 9 (VK_TAB); ch 27 → vk 27 (VK_ESCAPE); otherwise
+    `VkKeyScanW(ch)` — low byte becomes vk, and the shift-state high byte maps
+    into dwControlKeyState (1→SHIFT_PRESSED 0x10, 2→LEFT_CTRL_PRESSED 0x08,
+    4→LEFT_ALT_PRESSED 0x02); if VkKeyScanW returns -1 leave vk 0.
+  - Encode as a win32-input-mode sequence and write to the conpty input pipe:
+    `ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _` — all decimal integers:
+    Vk = wVirtualKeyCode, Sc = wVirtualScanCode, Uc = (int)UnicodeChar,
+    Kd = bKeyDown (1/0), Cs = dwControlKeyState, Rc = wRepeatCount.
+  - Only encode this way while `win32InputModeEnabled` is true (see below);
+    before that, fall back to writing the key-down UnicodeChar as UTF-8 bytes
+    (skip char 0), which is enough for the sub-second window before the inner
+    conpty announces the mode.
+  - Ignore MOUSE_EVENT and WINDOW_BUFFER_SIZE_EVENT records (size changes are
+    handled by the main-loop poll).
+- **win32InputModeEnabled**: OutputPump scans each output chunk (same cheap
+  ESC scan as the clear-screen detection) for `ESC[?9001h` → set the flag,
+  `ESC[?9001l` → clear it. ConPTY emits `?9001h` at startup, so the flag flips
+  almost immediately.
 - **OutputPump** (background thread): loop `ReadFile(conptyOutRead, buf 16384)`
   → under `lock(ConsoleLock)` `WriteFile(hStdOut)`. After each chunk set
   `Volatile.Write(ref lastOutputTicks, Stopwatch ticks)` and `screenDirty = true`.

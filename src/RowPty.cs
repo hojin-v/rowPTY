@@ -15,14 +15,18 @@ internal sealed class RowPty
     private const uint ENABLE_PROCESSED_OUTPUT = 0x0001;
     private const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
     private const uint DISABLE_NEWLINE_AUTO_RETURN = 0x0008;
+    private const uint ENABLE_WINDOW_INPUT = 0x0008;
     private const uint ENABLE_EXTENDED_FLAGS = 0x0080;
-    private const uint ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200;
+
+    private const ushort KEY_EVENT = 0x0001;
+    private const uint LEFT_ALT_PRESSED = 0x0002;
+    private const uint LEFT_CTRL_PRESSED = 0x0008;
+    private const uint SHIFT_PRESSED = 0x0010;
 
     private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
     private static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = new IntPtr(0x00020016);
 
     private const uint WAIT_OBJECT_0 = 0x00000000;
-    private const uint WAIT_TIMEOUT = 0x00000102;
     private const uint INFINITE = 0xffffffff;
 
     private const uint CTRL_C_EVENT = 0;
@@ -64,6 +68,7 @@ internal sealed class RowPty
 
     private volatile bool stopping;
     private volatile bool cleanupStarted;
+    private volatile bool win32InputModeEnabled;
     private bool fetchStop;
     private int fetchMaxWidth;
 
@@ -84,11 +89,6 @@ internal sealed class RowPty
 
     public static int Main(string[] args)
     {
-        if (args.Length > 0 && args[0] == "--rowpty-bootstrap")
-        {
-            return BootstrapMain(args);
-        }
-
         RowPty app = new RowPty();
         try
         {
@@ -134,151 +134,6 @@ internal sealed class RowPty
 
         int exitCode = RunMainLoop();
         return exitCode;
-    }
-
-    private static int BootstrapMain(string[] args)
-    {
-        try
-        {
-            int childStart = -1;
-            int i;
-            for (i = 1; i < args.Length; i++)
-            {
-                if (args[i] == "--")
-                {
-                    childStart = i + 1;
-                    break;
-                }
-            }
-            if (childStart < 0 || childStart >= args.Length)
-            {
-                Console.Error.WriteLine("rowpty: bootstrap missing child command");
-                return 2;
-            }
-
-            string[] childArgs = new string[args.Length - childStart];
-            Array.Copy(args, childStart, childArgs, 0, childArgs.Length);
-            return RunBootstrapChild(childArgs);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine("rowpty: bootstrap failed: " + ex.Message);
-            return 2;
-        }
-    }
-
-    private static int RunBootstrapChild(string[] childArgs)
-    {
-        IntPtr stdin = GetStdHandle(STD_INPUT_HANDLE);
-        IntPtr stdout = GetStdHandle(STD_OUTPUT_HANDLE);
-        uint inputMode;
-        uint outputMode;
-        bool haveInputMode = GetConsoleMode(stdin, out inputMode);
-        bool haveOutputMode = GetConsoleMode(stdout, out outputMode);
-        if (!haveInputMode || !haveOutputMode)
-        {
-            throw new UsageException("bootstrap stdin/stdout must be a real console");
-        }
-
-        uint originalCP = GetConsoleCP();
-        uint originalOutputCP = GetConsoleOutputCP();
-        bool handlerInstalled = false;
-
-        try
-        {
-            if (!SetConsoleCtrlHandler(CtrlDelegate, true))
-            {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "SetConsoleCtrlHandler failed");
-            }
-            handlerInstalled = true;
-
-            uint childInputMode = inputMode | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS;
-            uint childOutputMode = outputMode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
-            if (!SetConsoleMode(stdin, childInputMode))
-            {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "SetConsoleMode(bootstrap stdin) failed");
-            }
-            if (!SetConsoleMode(stdout, childOutputMode))
-            {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "SetConsoleMode(bootstrap stdout) failed");
-            }
-            SetConsoleCP(65001);
-            SetConsoleOutputCP(65001);
-
-            return CreatePlainChild(childArgs, stdin);
-        }
-        finally
-        {
-            SetConsoleMode(stdin, inputMode);
-            SetConsoleMode(stdout, outputMode);
-            SetConsoleCP(originalCP);
-            SetConsoleOutputCP(originalOutputCP);
-            if (handlerInstalled)
-            {
-                SetConsoleCtrlHandler(CtrlDelegate, false);
-            }
-        }
-    }
-
-    private static int CreatePlainChild(string[] childArgs, IntPtr stdin)
-    {
-        string commandLineText = BuildCommandLine(childArgs);
-        StringBuilder commandLine = new StringBuilder(commandLineText, commandLineText.Length + 1);
-        STARTUPINFOEX startupInfo = new STARTUPINFOEX();
-        startupInfo.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFO));
-
-        PROCESS_INFORMATION processInfo;
-        bool ok = CreateProcessW(
-            null,
-            commandLine,
-            IntPtr.Zero,
-            IntPtr.Zero,
-            false,
-            0,
-            IntPtr.Zero,
-            Directory.GetCurrentDirectory(),
-            ref startupInfo,
-            out processInfo);
-        if (!ok)
-        {
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateProcess(child) failed");
-        }
-
-        CloseHandleRef(ref processInfo.hThread);
-        while (true)
-        {
-            uint wait = WaitForSingleObject(processInfo.hProcess, 50);
-            if (wait == WAIT_OBJECT_0)
-            {
-                break;
-            }
-            if (wait != WAIT_TIMEOUT)
-            {
-                break;
-            }
-            KeepVirtualTerminalInput(stdin);
-        }
-
-        uint exitCode;
-        if (!GetExitCodeProcess(processInfo.hProcess, out exitCode))
-        {
-            exitCode = 1;
-        }
-        CloseHandleRef(ref processInfo.hProcess);
-        return unchecked((int)exitCode);
-    }
-
-    private static void KeepVirtualTerminalInput(IntPtr stdin)
-    {
-        uint mode;
-        if (!GetConsoleMode(stdin, out mode))
-        {
-            return;
-        }
-        if ((mode & ENABLE_VIRTUAL_TERMINAL_INPUT) == 0)
-        {
-            SetConsoleMode(stdin, mode | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS);
-        }
     }
 
     private static Options ParseOptions(string[] args, out bool handled, out int immediateExitCode)
@@ -442,7 +297,7 @@ internal sealed class RowPty
         }
         this.ctrlHandlerInstalled = true;
 
-        uint rawInputMode = ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS;
+        uint rawInputMode = ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT;
         uint rawOutputMode = ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
 
         if (!SetConsoleMode(this.hStdIn, rawInputMode))
@@ -503,7 +358,7 @@ internal sealed class RowPty
 
         startupInfo.lpAttributeList = this.attributeList;
 
-        string commandLineText = BuildBootstrapCommandLine(this.options.ChildArgs);
+        string commandLineText = BuildCommandLine(this.options.ChildArgs);
         StringBuilder commandLine = new StringBuilder(commandLineText, commandLineText.Length + 1);
         PROCESS_INFORMATION processInfo;
         bool ok = CreateProcessW(
@@ -654,20 +509,118 @@ internal sealed class RowPty
 
     private void InputPump()
     {
-        byte[] buffer = new byte[4096];
+        INPUT_RECORD[] records = new INPUT_RECORD[32];
         while (!this.stopping)
         {
-            int read;
-            bool ok = ReadFile(this.hStdIn, buffer, buffer.Length, out read, IntPtr.Zero);
-            if (!ok || read <= 0)
+            uint read;
+            bool ok = ReadConsoleInputW(this.hStdIn, records, (uint)records.Length, out read);
+            if (!ok || read == 0)
             {
                 break;
             }
-            if (!WriteAll(this.conptyInWrite, buffer, read))
+
+            uint i;
+            for (i = 0; i < read; i++)
             {
-                break;
+                if (records[i].EventType != KEY_EVENT)
+                {
+                    continue;
+                }
+
+                KEY_EVENT_RECORD key = records[i].KeyEvent;
+                RepairKeyEvent(ref key);
+
+                if (this.win32InputModeEnabled)
+                {
+                    byte[] sequence = EncodeWin32InputMode(key);
+                    if (!WriteAll(this.conptyInWrite, sequence, sequence.Length))
+                    {
+                        return;
+                    }
+                }
+                else if (key.bKeyDown != 0 && key.UnicodeChar != (char)0)
+                {
+                    byte[] bytes = Encoding.UTF8.GetBytes(new char[] { key.UnicodeChar });
+                    if (!WriteAll(this.conptyInWrite, bytes, bytes.Length))
+                    {
+                        return;
+                    }
+                }
             }
         }
+    }
+
+    private static void RepairKeyEvent(ref KEY_EVENT_RECORD key)
+    {
+        if (key.wVirtualKeyCode != 0 || key.UnicodeChar == (char)0)
+        {
+            return;
+        }
+
+        char ch = key.UnicodeChar;
+        if (ch == (char)13)
+        {
+            key.wVirtualKeyCode = 13;
+            return;
+        }
+        if (ch == (char)8 || ch == (char)127)
+        {
+            key.wVirtualKeyCode = 8;
+            key.UnicodeChar = (char)8;
+            return;
+        }
+        if (ch == (char)9)
+        {
+            key.wVirtualKeyCode = 9;
+            return;
+        }
+        if (ch == (char)27)
+        {
+            key.wVirtualKeyCode = 27;
+            return;
+        }
+
+        short vkey = VkKeyScanW(ch);
+        if (vkey == -1)
+        {
+            return;
+        }
+
+        int packed = (int)vkey;
+        int shiftState = (packed >> 8) & 0xff;
+        key.wVirtualKeyCode = (ushort)(packed & 0xff);
+        if ((shiftState & 1) != 0)
+        {
+            key.dwControlKeyState = key.dwControlKeyState | SHIFT_PRESSED;
+        }
+        if ((shiftState & 2) != 0)
+        {
+            key.dwControlKeyState = key.dwControlKeyState | LEFT_CTRL_PRESSED;
+        }
+        if ((shiftState & 4) != 0)
+        {
+            key.dwControlKeyState = key.dwControlKeyState | LEFT_ALT_PRESSED;
+        }
+    }
+
+    private static byte[] EncodeWin32InputMode(KEY_EVENT_RECORD key)
+    {
+        StringBuilder builder = new StringBuilder(48);
+        builder.Append('\u001b');
+        builder.Append('[');
+        builder.Append(((int)key.wVirtualKeyCode).ToString(CultureInfo.InvariantCulture));
+        builder.Append(';');
+        builder.Append(((int)key.wVirtualScanCode).ToString(CultureInfo.InvariantCulture));
+        builder.Append(';');
+        builder.Append(((int)key.UnicodeChar).ToString(CultureInfo.InvariantCulture));
+        builder.Append(';');
+        builder.Append((key.bKeyDown != 0 ? 1 : 0).ToString(CultureInfo.InvariantCulture));
+        builder.Append(';');
+        builder.Append(key.dwControlKeyState.ToString(CultureInfo.InvariantCulture));
+        builder.Append(';');
+        builder.Append(((int)key.wRepeatCount).ToString(CultureInfo.InvariantCulture));
+        builder.Append('_');
+        return Encoding.UTF8.GetBytes(builder.ToString());
     }
 
     private void OutputPump()
@@ -683,6 +636,16 @@ internal sealed class RowPty
             }
 
             bool clearSeen = ScanForClear(buffer, read);
+            int win32InputModeChange = ScanForWin32InputMode(buffer, read);
+            if (win32InputModeChange > 0)
+            {
+                this.win32InputModeEnabled = true;
+            }
+            else if (win32InputModeChange < 0)
+            {
+                this.win32InputModeEnabled = false;
+            }
+
             lock (this.consoleLock)
             {
                 if (!WriteAll(this.hStdOut, buffer, read))
@@ -1058,52 +1021,6 @@ internal sealed class RowPty
         return coord;
     }
 
-    private static string BuildBootstrapCommandLine(string[] childArgs)
-    {
-        string executable = GetCurrentExecutablePath();
-        string[] bootstrapArgs = new string[childArgs.Length + 3];
-        bootstrapArgs[0] = executable;
-        bootstrapArgs[1] = "--rowpty-bootstrap";
-        bootstrapArgs[2] = "--";
-        Array.Copy(childArgs, 0, bootstrapArgs, 3, childArgs.Length);
-        return BuildCommandLine(bootstrapArgs);
-    }
-
-    private static string GetCurrentExecutablePath()
-    {
-        string path = "";
-        try
-        {
-            System.Reflection.Assembly assembly = System.Reflection.Assembly.GetEntryAssembly();
-            if (assembly != null)
-            {
-                path = assembly.Location;
-            }
-        }
-        catch (Exception)
-        {
-            path = "";
-        }
-
-        if (path == null || path.Length == 0)
-        {
-            try
-            {
-                path = Process.GetCurrentProcess().MainModule.FileName;
-            }
-            catch (Exception)
-            {
-                path = "";
-            }
-        }
-
-        if (path == null || path.Length == 0)
-        {
-            throw new InvalidOperationException("could not locate rowpty executable");
-        }
-        return path;
-    }
-
     private static string BuildCommandLine(string[] args)
     {
         StringBuilder builder = new StringBuilder();
@@ -1270,6 +1187,31 @@ internal sealed class RowPty
             }
         }
         return false;
+    }
+
+    private static int ScanForWin32InputMode(byte[] buffer, int count)
+    {
+        int mode = 0;
+        int i;
+        for (i = 0; i < count; i++)
+        {
+            if (buffer[i] != 27)
+            {
+                continue;
+            }
+            if (i + 7 < count &&
+                buffer[i + 1] == (byte)'[' &&
+                buffer[i + 2] == (byte)'?' &&
+                buffer[i + 3] == (byte)'9' &&
+                buffer[i + 4] == (byte)'0' &&
+                buffer[i + 5] == (byte)'0' &&
+                buffer[i + 6] == (byte)'1' &&
+                (buffer[i + 7] == (byte)'h' || buffer[i + 7] == (byte)'l'))
+            {
+                mode = buffer[i + 7] == (byte)'h' ? 1 : -1;
+            }
+        }
+        return mode;
     }
 
     private static bool WriteAll(IntPtr handle, byte[] buffer, int count)
@@ -1524,6 +1466,26 @@ internal sealed class RowPty
         public int dwThreadId;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct KEY_EVENT_RECORD
+    {
+        public int bKeyDown;
+        public ushort wRepeatCount;
+        public ushort wVirtualKeyCode;
+        public ushort wVirtualScanCode;
+        public char UnicodeChar;
+        public uint dwControlKeyState;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct INPUT_RECORD
+    {
+        [FieldOffset(0)]
+        public ushort EventType;
+        [FieldOffset(4)]
+        public KEY_EVENT_RECORD KeyEvent;
+    }
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr GetStdHandle(int nStdHandle);
 
@@ -1557,8 +1519,14 @@ internal sealed class RowPty
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool ReadFile(IntPtr hFile, byte[] lpBuffer, int nNumberOfBytesToRead, out int lpNumberOfBytesRead, IntPtr lpOverlapped);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool ReadConsoleInputW(IntPtr hConsoleInput, [Out] INPUT_RECORD[] lpBuffer, uint nLength, out uint lpNumberOfEventsRead);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool WriteFile(IntPtr hFile, byte[] lpBuffer, int nNumberOfBytesToWrite, out int lpNumberOfBytesWritten, IntPtr lpOverlapped);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern short VkKeyScanW(char ch);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);

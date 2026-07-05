@@ -44,7 +44,7 @@ WSL/Linux/macOS에서는 POSIX PTY로 "자식에게 화면을 한 줄 짧게 알
    ```
    rowpty.exe --interval 10 --status-cmd "cmd /d /c echo width={MAXWIDTH}" -- codex
    ```
-4. ai-battery와 함께 쓰려면 exe와 번들 ConPTY를 검색 경로에 복사합니다:
+4. ai-battery 사용자는 이 단계가 필요 없습니다 — `ai-battery setup`이 ai-battery 패키지에 동봉된 이 소스(`vendor/rowpty/RowPty.cs`)를 사용자 머신에서 직접 컴파일해 설치합니다(서명 없는 바이너리 배포 회피). 수동 설치는:
    ```
    copy bin\rowpty.exe %LOCALAPPDATA%\ai-battery\bin\
    copy bin\conpty.dll %LOCALAPPDATA%\ai-battery\bin\

@@ -588,11 +588,13 @@ internal sealed class RowPty
                     if (nowMs - this.lastOutputMs >= this.options.SettleMs)
                     {
                         paintNow = true;
+                        forced = true;
                         clearDirty = true;
                     }
                     else if (nowMs - this.lastPaintMs >= 750)
                     {
                         paintNow = true;
+                        forced = true;
                         clearDirty = true;
                     }
                 }
@@ -1375,6 +1377,14 @@ internal sealed class RowPty
                 continue;
             }
             if (i + 1 < count && buffer[i + 1] == (byte)'c')
+            {
+                return true;
+            }
+            if (i + 2 < count && buffer[i + 1] == (byte)'[' && buffer[i + 2] == (byte)'J')
+            {
+                return true;
+            }
+            if (i + 3 < count && buffer[i + 1] == (byte)'[' && buffer[i + 2] == (byte)'0' && buffer[i + 3] == (byte)'J')
             {
                 return true;
             }

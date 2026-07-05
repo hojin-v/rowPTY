@@ -165,6 +165,11 @@ Every 50 ms tick:
    - else if `screenDirty` and `now - lastPaint >= 750 ms` → paint anyway
      (child streaming continuously), clear dirty;
    - else if status text changed since last paint → paint.
+   - **Dirty paints must bypass the unchanged-line dedup** (the Python runner's
+     `dirty=True`): child output may have wiped the status row — e.g. a
+     clear-to-end-of-screen reaching the real bottom row — so the same text
+     must still be rewritten. Only the "nothing dirty, text unchanged" case may
+     skip the write.
 4b. **Ground-state gating**: a paint injected between two output chunks that
    split an escape sequence corrupts the child's output. OutputPump therefore
    tracks a minimal VT parser state across chunks (Ground / Esc / CSI / OSC /
@@ -179,8 +184,10 @@ Every 50 ms tick:
    Skip the write entirely if the padded line AND row are unchanged since the
    last paint and this paint wasn't forced (resize / clear-screen detection).
 6. Clear-screen detection: OutputPump scans each chunk (cheap byte scan for
-   ESC) for `\x1bc`, `\x1b[2J`, `\x1b[3J`, `\x1b[?1049h/l`; if seen, set a
-   `forceRepaint` flag the main loop honors for the next ~3 paints.
+   ESC) for `\x1bc`, `\x1b[2J`, `\x1b[3J`, `\x1b[?1049h/l`, and the
+   erase-to-end-of-screen forms `\x1b[J` / `\x1b[0J` (which reach the real
+   bottom row even though the child's screen is one row shorter); if seen, set
+   a `forceRepaint` flag the main loop honors for the next ~3 paints.
 
 ### Shutdown
 

@@ -99,6 +99,28 @@ function check(name, ok, detail) {
   }
 }
 
+// 2c) status row is repainted after the child wipes it, even with unchanged text
+// Regression test for: dirty repaints were dedup-skipped and ED-to-end
+// (ESC[0J, which reaches the real bottom row) was not detected, so the
+// battery bar stayed invisible while Codex streamed a response.
+{
+  const res = await runInPty([
+    ROWPTY,
+    "--interval", "60",
+    "--status-cmd", "cmd /d /c echo BATT-{MAXWIDTH}",
+    "--",
+    process.execPath, path.join(HERE, "wipeprobe.js")
+  ]);
+  const wipeAt = res.out.lastIndexOf("WIPE-NOW");
+  check("wipe probe ran", wipeAt >= 0, res.out.slice(-300));
+  if (wipeAt >= 0) {
+    const after = res.out.slice(wipeAt);
+    const repainted = after.includes(`\x1b[${ROWS};1H`) && after.includes("BATT-");
+    check("status row repainted after ED wipe with unchanged text", repainted,
+      "post-wipe output lacks a bottom-row repaint: " + JSON.stringify(after.slice(0, 300)));
+  }
+}
+
 // 3) non-console stdio is rejected cleanly (direct spawn, no pty)
 {
   const { spawnSync } = await import("node:child_process");

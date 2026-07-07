@@ -29,6 +29,7 @@ WSL/Linux/macOS에서는 POSIX PTY로 "자식에게 화면을 한 줄 짧게 알
 | Lock-serialized writes | 출력 펌프와 페인터가 단일 프로세스에서 직렬화되어 이스케이프 시퀀스가 끊기지 않습니다 |
 | Status command | 임의의 명령을 주기 실행해 stdout을 상태줄로 표시, `{MAXWIDTH}` 토큰으로 가용 폭 전달 |
 | Resize / clear-screen 대응 | 창 크기 변화를 감지해 ConPTY를 리사이즈하고, 화면 클리어 시퀀스 후 상태줄을 복구합니다 |
+| Scrollback 보존 필터 | alternate-screen 전환과 `CSI 3J` scrollback clear를 기본 차단합니다. 필요하면 `ROWPTY_PRESERVE_SCROLLBACK=0`으로 비활성화합니다 |
 | 최신 ConPTY 번들 | exe 옆의 `conpty.dll`(Windows Terminal의 passthrough ConPTY)을 자동 로드해 스크롤 영역 기반 TUI 출력(스트리밍 응답, 히스토리 삽입)을 원형 그대로 전달합니다. 없으면 OS 내장 ConPTY로 폴백, `ROWPTY_NO_CONPTY_DLL=1`로 비활성화 |
 | Paint 안전 지점 판정 | 출력 스트림의 VT 파서 상태를 추적해 이스케이프 시퀀스 중간에는 상태줄을 그리지 않습니다 (2초 기아 방지 탈출 포함) |
 | Exit-code passthrough | 자식의 종료 코드를 그대로 반환합니다 |

@@ -216,9 +216,9 @@ Wrap the whole run in try/finally so modes/CPs are restored even on exceptions.
   UTF-8), rather than whatever Node's tty layer chooses.
 - Input is a pure byte passthrough — no DEL/BS rewriting.
 
-Residual risk: the OS ConPTY still mediates the child's output. On current
-Win11 builds plain scrolled lines are emitted as ordinary linefeed scrolling,
-so the outer terminal keeps scrollback; if a regression appears, the
+Residual risk: the OS ConPTY still mediates the child's output. rowpty now
+filters alternate-screen toggles and `CSI 3J` scrollback clears before writing
+to the host console; if a deeper ConPTY regression appears, the
 `AI_BATTERY_WIN_LAYOUT=overlay` fallback in ai-battery remains.
 
 ## Build

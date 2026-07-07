@@ -82,6 +82,11 @@ child process attached to the ConPTY, believes terminal is rows-N tall
    (bytes flow to the child instead); for CTRL_CLOSE_EVENT run Cleanup and
    return FALSE.
 4. Read size via `GetConsoleScreenBufferInfo` (srWindow width/height, min 20x4).
+   Set the host console scroll region to `1..rows-N`, preserving and restoring
+   the cursor around the `DECSTBM` write. This mirrors the POSIX runner more
+   closely: child output scrolls inside the same shortened viewport that the
+   child was told about, while the real bottom row remains outside the host
+   scroll model for the status line.
 5. Create two pipe pairs (`CreatePipe`, default security, 0 size), then create
    the pseudo console sized {cols, rows-N} and close the child-side handles
    (inRead, outWrite) in the parent after creation.
@@ -193,9 +198,10 @@ Every 50 ms tick:
 
 1. Wait for the child, get exit code.
 2. `ClosePseudoConsole`, close pipe handles, join pumps (with timeout).
-3. Clear the status row: `ESC 7 ESC [0m ESC [{row};1H ESC [2K ESC 8`.
-4. Restore original console modes and code pages.
-5. `Environment.Exit(childExitCode)`.
+3. Reset the host scroll region with `ESC[r`.
+4. Clear the status row: `ESC 7 ESC [0m ESC [{row};1H ESC [2K ESC 8`.
+5. Restore original console modes and code pages.
+6. `Environment.Exit(childExitCode)`.
 
 Wrap the whole run in try/finally so modes/CPs are restored even on exceptions.
 

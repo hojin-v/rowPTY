@@ -59,6 +59,7 @@ internal sealed class RowPty
     private uint originalConsoleOutputCP;
     private bool consoleStateSaved;
     private bool outputConfigured;
+    private bool hostScrollRegionConfigured;
     private bool ctrlHandlerInstalled;
 
     private IntPtr hPseudoConsole = IntPtr.Zero;
@@ -148,6 +149,7 @@ internal sealed class RowPty
         {
             throw new Win32Exception(Marshal.GetLastWin32Error(), "GetConsoleScreenBufferInfo failed");
         }
+        ConfigureHostScrollRegion();
         ResolveConptyProvider();
         CreatePseudoConsoleAndChild();
         StartThreads();
@@ -559,6 +561,7 @@ internal sealed class RowPty
                     {
                         this.currentCols = cols;
                         this.currentRows = rows;
+                        ConfigureHostScrollRegion();
                         this.resizePseudoConsoleProvider(this.hPseudoConsole, MakeSize(cols, ChildRows(rows)));
                         if (childOutputSeenNow)
                         {
@@ -1088,26 +1091,99 @@ internal sealed class RowPty
         return true;
     }
 
-    private bool WriteStatusRowPayload(string payload)
+    private static bool HostScrollRegionDisabled()
+    {
+        string value = Environment.GetEnvironmentVariable("ROWPTY_NO_SCROLL_REGION");
+        return value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void ConfigureHostScrollRegion()
+    {
+        if (HostScrollRegionDisabled() || !this.outputConfigured || this.hStdOut == IntPtr.Zero)
+        {
+            return;
+        }
+
+        int bottom = ChildRows(this.currentRows);
+        if (bottom >= this.currentRows)
+        {
+            RestoreHostScrollRegion();
+            return;
+        }
+
+        string payload = "\u001b7\u001b[1;" + bottom.ToString(CultureInfo.InvariantCulture) + "r\u001b8";
+        lock (this.consoleLock)
+        {
+            WriteConsoleControlPayload(payload);
+            this.hostScrollRegionConfigured = true;
+        }
+    }
+
+    private void RestoreHostScrollRegion()
+    {
+        if (!this.outputConfigured || this.hStdOut == IntPtr.Zero || !this.hostScrollRegionConfigured)
+        {
+            return;
+        }
+
+        lock (this.consoleLock)
+        {
+            WriteConsoleControlPayload("\u001b7\u001b[r\u001b8");
+            this.hostScrollRegionConfigured = false;
+        }
+    }
+
+    private bool WriteConsoleControlPayload(string payload)
     {
         byte[] bytes = Encoding.UTF8.GetBytes(payload);
+        return WriteAll(this.hStdOut, bytes, bytes.Length);
+    }
 
+    private bool WriteStatusRowPayload(string payload)
+    {
+        // Paint the reserved bottom row, then move the cursor back to wherever
+        // the child left it -- all in ONE write. We already hold consoleLock,
+        // so the child cannot move the cursor underneath us; reading it with
+        // GetConsoleScreenBufferInfo lets us restore via an absolute CUP
+        // (ESC[row;colH) instead of DECSC/DECRC (ESC 7 / ESC 8). That matters
+        // because DECSC/DECRC share a SINGLE save slot: crossterm children
+        // (Codex) use the same slot for their own save/restore, so painting
+        // through it made Codex restore its cursor to our status row --
+        // corrupting its layout and leaving the cursor flickering between
+        // positions. A computed CUP touches no shared state, and folding both
+        // moves into one write keeps the cursor off the status row (no flicker
+        // the way two SetConsoleCursorPosition calls produced).
+        char esc = (char)27;
         CONSOLE_SCREEN_BUFFER_INFO info;
         if (GetConsoleScreenBufferInfo(this.hStdOut, out info))
         {
-            COORD saved = info.dwCursorPosition;
-            COORD target = new COORD();
-            target.X = info.srWindow.Left;
-            target.Y = info.srWindow.Bottom;
-            if (SetConsoleCursorPosition(this.hStdOut, target))
+            int savedRow = info.dwCursorPosition.Y - info.srWindow.Top + 1;
+            int savedCol = info.dwCursorPosition.X - info.srWindow.Left + 1;
+            if (savedRow < 1)
             {
-                bool ok = WriteAll(this.hStdOut, bytes, bytes.Length);
-                SetConsoleCursorPosition(this.hStdOut, saved);
-                return ok;
+                savedRow = 1;
             }
+            if (savedRow > this.currentRows)
+            {
+                savedRow = this.currentRows;
+            }
+            if (savedCol < 1)
+            {
+                savedCol = 1;
+            }
+            if (savedCol > this.currentCols)
+            {
+                savedCol = this.currentCols;
+            }
+            string framed = esc + "[" + this.currentRows.ToString(CultureInfo.InvariantCulture) + ";1H"
+                + payload
+                + esc + "[" + savedRow.ToString(CultureInfo.InvariantCulture) + ";" + savedCol.ToString(CultureInfo.InvariantCulture) + "H";
+            byte[] bytes = Encoding.UTF8.GetBytes(framed);
+            return WriteAll(this.hStdOut, bytes, bytes.Length);
         }
 
-        string fallback = "\u001b[s\u001b[0m\u001b[" + this.currentRows.ToString(CultureInfo.InvariantCulture) + ";1H" + payload + "\u001b[u";
+        // Fallback when the cursor position is unavailable: pure VT DECSC/DECRC.
+        string fallback = esc + "7" + esc + "[" + this.currentRows.ToString(CultureInfo.InvariantCulture) + ";1H" + payload + esc + "8";
         byte[] fallbackBytes = Encoding.UTF8.GetBytes(fallback);
         return WriteAll(this.hStdOut, fallbackBytes, fallbackBytes.Length);
     }
@@ -1946,6 +2022,7 @@ internal sealed class RowPty
         JoinThread(this.outputThread, 500);
         JoinThread(this.statusThread, 2000);
 
+        RestoreHostScrollRegion();
         ClearStatusRow();
 
         if (this.consoleStateSaved)

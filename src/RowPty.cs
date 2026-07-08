@@ -595,33 +595,37 @@ internal sealed class RowPty
                 {
                     paintNow = false;
                 }
-                else if (this.forceRepaintCount > 0)
-                {
-                    // A clear/erase (ScanForClear) may have wiped the reserved
-                    // row, so rewrite it unconditionally.
-                    paintNow = true;
-                    forced = true;
-                    clearDirty = true;
-                    consumeForceRepaint = true;
-                }
                 else if (this.screenDirty && nowMs - this.lastOutputMs >= this.options.SettleMs)
                 {
-                    // Child output settled: repaint, but let PaintStatus's
-                    // needsWrite decide whether to actually write. The host
-                    // scroll region keeps the child from scrolling the row
-                    // away, so when the status text is unchanged there is
-                    // nothing to redraw -- and skipping the write avoids
-                    // moving the child's hardware cursor. Forcing a rewrite on
-                    // every quiet moment (and every 750ms mid-stream) is what
-                    // made the cursor bounce between the status row and the
-                    // child's cursor, showing up as two rapidly blinking
-                    // cursors and a misaligned composer.
+                    // Repaint ONLY when the child's output has settled -- it
+                    // has finished a render and its cursor is at rest. This is
+                    // the only place the reserved row is touched during normal
+                    // operation. Painting mid-render (as the old immediate
+                    // clear-repaint and the 750ms force-rewrite did) captured
+                    // the child's cursor at a transient position, so the single
+                    // hardware cursor bounced between the composer and the
+                    // footer -- looking like two rapidly blinking cursors.
                     paintNow = true;
                     clearDirty = true;
+                    if (this.forceRepaintCount > 0)
+                    {
+                        // A clear/erase (ScanForClear) may have wiped the row;
+                        // force the write even when the status text is
+                        // unchanged. Otherwise PaintStatus.needsWrite skips the
+                        // write for an unchanged row -- the scroll region keeps
+                        // it from being scrolled away, so an idle child's
+                        // cursor is never disturbed.
+                        forced = true;
+                        consumeForceRepaint = true;
+                    }
                 }
 
-                if (this.childOutputSeen && !paintNow && version != this.paintedStatusVersion)
+                if (this.childOutputSeen && !paintNow && !this.screenDirty
+                    && version != this.paintedStatusVersion)
                 {
+                    // Battery text changed while the child is idle (no pending
+                    // output). Safe to repaint now: the cursor is at rest, so
+                    // reading it back for the restore lands in the right place.
                     paintNow = true;
                 }
             }

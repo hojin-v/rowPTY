@@ -607,14 +607,21 @@ internal sealed class RowPty
                     // footer -- looking like two rapidly blinking cursors.
                     paintNow = true;
                     clearDirty = true;
+                    if (!this.hostScrollRegionConfigured)
+                    {
+                        // No scroll region (the default): the child scrolls and
+                        // erases the whole buffer natively, so it can overwrite
+                        // the reserved bottom row at any time. Force the rewrite
+                        // at every settle to keep the battery visible. This is
+                        // still flicker-free: it only runs once the child has
+                        // settled (cursor at rest), and the move->paint->restore
+                        // is one atomic write, so the cursor never lands off the
+                        // composer.
+                        forced = true;
+                    }
                     if (this.forceRepaintCount > 0)
                     {
-                        // A clear/erase (ScanForClear) may have wiped the row;
-                        // force the write even when the status text is
-                        // unchanged. Otherwise PaintStatus.needsWrite skips the
-                        // write for an unchanged row -- the scroll region keeps
-                        // it from being scrolled away, so an idle child's
-                        // cursor is never disturbed.
+                        // A clear/erase (ScanForClear) definitely wiped the row.
                         forced = true;
                         consumeForceRepaint = true;
                     }
@@ -1097,15 +1104,22 @@ internal sealed class RowPty
         return true;
     }
 
-    private static bool HostScrollRegionDisabled()
+    private static bool HostScrollRegionEnabled()
     {
-        string value = Environment.GetEnvironmentVariable("ROWPTY_NO_SCROLL_REGION");
+        // OFF by default. A DECSTBM bottom margin corrupts the host scrollback
+        // on Windows (both Windows Terminal and legacy conhost captured the
+        // fixed rows -- composer/footer/battery -- into scrollback as ghost
+        // frames, and cmd's console host also offset the composer). Codex is an
+        // inline app, so we let it scroll the main buffer natively and just
+        // repaint the battery over the reserved bottom row. Opt back in with
+        // ROWPTY_SCROLL_REGION=1 for terminals where the margin behaves.
+        string value = Environment.GetEnvironmentVariable("ROWPTY_SCROLL_REGION");
         return value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
     }
 
     private void ConfigureHostScrollRegion()
     {
-        if (HostScrollRegionDisabled() || !this.outputConfigured || this.hStdOut == IntPtr.Zero)
+        if (!HostScrollRegionEnabled() || !this.outputConfigured || this.hStdOut == IntPtr.Zero)
         {
             return;
         }

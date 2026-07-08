@@ -597,25 +597,27 @@ internal sealed class RowPty
                 }
                 else if (this.forceRepaintCount > 0)
                 {
+                    // A clear/erase (ScanForClear) may have wiped the reserved
+                    // row, so rewrite it unconditionally.
                     paintNow = true;
                     forced = true;
                     clearDirty = true;
                     consumeForceRepaint = true;
                 }
-                else if (this.screenDirty)
+                else if (this.screenDirty && nowMs - this.lastOutputMs >= this.options.SettleMs)
                 {
-                    if (nowMs - this.lastOutputMs >= this.options.SettleMs)
-                    {
-                        paintNow = true;
-                        forced = true;
-                        clearDirty = true;
-                    }
-                    else if (nowMs - this.lastPaintMs >= 750)
-                    {
-                        paintNow = true;
-                        forced = true;
-                        clearDirty = true;
-                    }
+                    // Child output settled: repaint, but let PaintStatus's
+                    // needsWrite decide whether to actually write. The host
+                    // scroll region keeps the child from scrolling the row
+                    // away, so when the status text is unchanged there is
+                    // nothing to redraw -- and skipping the write avoids
+                    // moving the child's hardware cursor. Forcing a rewrite on
+                    // every quiet moment (and every 750ms mid-stream) is what
+                    // made the cursor bounce between the status row and the
+                    // child's cursor, showing up as two rapidly blinking
+                    // cursors and a misaligned composer.
+                    paintNow = true;
+                    clearDirty = true;
                 }
 
                 if (this.childOutputSeen && !paintNow && version != this.paintedStatusVersion)

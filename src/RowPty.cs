@@ -24,6 +24,11 @@ internal sealed class RowPty
     private const uint SHIFT_PRESSED = 0x0010;
 
     private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    private const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
+    private const uint CREATE_BREAKAWAY_FROM_JOB = 0x01000000;
+    private const uint CREATE_NO_WINDOW = 0x08000000;
+    private const int STARTF_USESHOWWINDOW = 0x00000001;
+    private const short SW_HIDE = 0;
     private static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = new IntPtr(0x00020016);
 
     private const uint WAIT_OBJECT_0 = 0x00000000;
@@ -41,6 +46,17 @@ internal sealed class RowPty
     private const int VT_STATE_OSC_ESC = 5;
     private const int VT_STATE_DCS_ESC = 6;
 
+    private static readonly byte[] HostClearDisplayAction = Encoding.ASCII.GetBytes("\u001b]633;RowPtyClearDisplay\u0007");
+    private static readonly byte[] HostClearFromCursorAction = Encoding.ASCII.GetBytes("\u001b]633;RowPtyClearFromCursor\u0007");
+
+    // The bundled Windows Terminal ConPTY (conpty.dll >= 1.22) probes the
+    // hosting terminal with a DA1 query (ESC[c) at startup and blocks in
+    // WaitUntilDA1(3000) until a response arrives. InputPump deliberately
+    // drops terminal responses coming back from the real host (they would
+    // otherwise leak into the child's composer), so rowpty answers the probe
+    // itself and swallows the query before it reaches the host terminal.
+    private static readonly byte[] Da1Response = Encoding.ASCII.GetBytes("\x1b[?61;6;7;14;21;22;23;24;28;32;42c");
+
     private static readonly ConsoleCtrlDelegate CtrlDelegate = new ConsoleCtrlDelegate(ConsoleCtrlHandler);
     private static RowPty activeInstance;
 
@@ -49,6 +65,7 @@ internal sealed class RowPty
     private readonly object statusLock = new object();
     private readonly object fetchLock = new object();
     private readonly object cleanupLock = new object();
+    private readonly object conptyInputWriteLock = new object();
 
     private Options options;
     private IntPtr hStdIn = IntPtr.Zero;
@@ -87,7 +104,9 @@ internal sealed class RowPty
 
     private Stopwatch clock;
     private bool preserveScrollback = true;
+    private bool filterAlternateScreen;
     private byte[] pendingHostOutput = new byte[0];
+    private volatile bool da1QueryAnswered;
     private bool childOutputSeen;
     private bool screenDirty;
     private long lastOutputMs;
@@ -133,6 +152,19 @@ internal sealed class RowPty
 
     private int Execute(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--foreground-terminal")
+        {
+            long window = ForegroundTerminalWindow();
+            string title = TerminalWindowTitle(new IntPtr(window));
+            Console.WriteLine(window.ToString(CultureInfo.InvariantCulture) + "\t" + Convert.ToBase64String(Encoding.UTF8.GetBytes(title)));
+            return 0;
+        }
+
+        if (args.Length > 0 && args[0] == "--launch-detached")
+        {
+            return LaunchDetached(args);
+        }
+
         bool handled;
         int immediateExitCode;
         this.options = ParseOptions(args, out handled, out immediateExitCode);
@@ -142,6 +174,7 @@ internal sealed class RowPty
         }
 
         this.preserveScrollback = PreserveScrollbackEnabled();
+        this.filterAlternateScreen = FilterAlternateScreenEnabled();
         this.clock = Stopwatch.StartNew();
         this.outputVtStateChangedMs = this.clock.ElapsedMilliseconds;
         SetupConsole();
@@ -156,6 +189,101 @@ internal sealed class RowPty
 
         int exitCode = RunMainLoop();
         return exitCode;
+    }
+
+    private static int LaunchDetached(string[] args)
+    {
+        if (args.Length < 3 || args.Length > 4)
+        {
+            throw new UsageException("--launch-detached requires COMMAND_BASE64 CWD_BASE64 [WINDOW_PLACEHOLDER]");
+        }
+
+        string commandLineText;
+        string workingDirectory;
+        try
+        {
+            commandLineText = Encoding.UTF8.GetString(Convert.FromBase64String(args[1]));
+            workingDirectory = Encoding.UTF8.GetString(Convert.FromBase64String(args[2]));
+        }
+        catch (FormatException)
+        {
+            throw new UsageException("--launch-detached arguments must be base64-encoded UTF-8");
+        }
+
+        if (args.Length == 4 && args[3].Length > 0)
+        {
+            commandLineText = commandLineText.Replace(args[3], ForegroundTerminalWindow().ToString(CultureInfo.InvariantCulture));
+        }
+
+        STARTUPINFOEX startupInfo = new STARTUPINFOEX();
+        startupInfo.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        startupInfo.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
+        startupInfo.StartupInfo.wShowWindow = SW_HIDE;
+        StringBuilder commandLine = new StringBuilder(commandLineText, commandLineText.Length + 1);
+        PROCESS_INFORMATION processInfo;
+        bool ok = CreateProcessW(
+            null,
+            commandLine,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            false,
+            CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            IntPtr.Zero,
+            workingDirectory,
+            ref startupInfo,
+            out processInfo);
+        if (!ok)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "detached CreateProcess failed");
+        }
+
+        CloseHandle(processInfo.hThread);
+        CloseHandle(processInfo.hProcess);
+        return 0;
+    }
+
+    private static long ForegroundTerminalWindow()
+    {
+        IntPtr window = GetForegroundWindow();
+        if (window == IntPtr.Zero)
+        {
+            return 0;
+        }
+
+        uint processId;
+        GetWindowThreadProcessId(window, out processId);
+        try
+        {
+            string name = Process.GetProcessById((int)processId).ProcessName.ToLowerInvariant();
+            string[] terminals = { "windowsterminal", "conhost", "wezterm-gui", "alacritty", "code", "hyper", "tabby", "conemu64", "conemu" };
+            for (int i = 0; i < terminals.Length; i++)
+            {
+                if (name == terminals[i])
+                {
+                    return window.ToInt64();
+                }
+            }
+        }
+        catch
+        {
+            return 0;
+        }
+        return 0;
+    }
+
+    private static string TerminalWindowTitle(IntPtr window)
+    {
+        if (window == IntPtr.Zero)
+        {
+            return "";
+        }
+        int length = GetWindowTextLengthW(window);
+        if (length <= 0)
+        {
+            return "";
+        }
+        StringBuilder title = new StringBuilder(length + 1);
+        return GetWindowTextW(window, title, title.Capacity) > 0 ? title.ToString() : "";
     }
 
     private static Options ParseOptions(string[] args, out bool handled, out int immediateExitCode)
@@ -291,6 +419,8 @@ internal sealed class RowPty
         Console.WriteLine("--reserve N          rows reserved at the bottom (default 1, clamp 1..5)");
         Console.WriteLine("--status-cmd CMD     command line used to fetch status text");
         Console.WriteLine("--settle-ms N        quiet time after child output before painting (default 50)");
+        Console.WriteLine("--foreground-terminal print the active terminal window handle and exit");
+        Console.WriteLine("--launch-detached COMMAND_BASE64 CWD_BASE64 [WINDOW_PLACEHOLDER]");
         Console.WriteLine("--version / --help");
     }
 
@@ -559,8 +689,10 @@ internal sealed class RowPty
                 {
                     if (cols != this.currentCols || rows != this.currentRows)
                     {
+                        int previousStatusRow = this.lastPaintedRow;
                         this.currentCols = cols;
                         this.currentRows = rows;
+                        ClearStaleStatusRow(previousStatusRow);
                         ConfigureHostScrollRegion();
                         this.resizePseudoConsoleProvider(this.hPseudoConsole, MakeSize(cols, ChildRows(rows)));
                         if (childOutputSeenNow)
@@ -688,7 +820,12 @@ internal sealed class RowPty
                     }
 
                     byte[] sequence = EncodeWin32InputMode(key);
-                    if (!WriteAll(this.conptyInWrite, sequence, sequence.Length))
+                    bool sequenceWritten;
+                    lock (this.conptyInputWriteLock)
+                    {
+                        sequenceWritten = WriteAll(this.conptyInWrite, sequence, sequence.Length);
+                    }
+                    if (!sequenceWritten)
                     {
                         return;
                     }
@@ -696,7 +833,12 @@ internal sealed class RowPty
                 else if (key.bKeyDown != 0 && key.UnicodeChar != (char)0)
                 {
                     byte[] bytes = Encoding.UTF8.GetBytes(new char[] { key.UnicodeChar });
-                    if (!WriteAll(this.conptyInWrite, bytes, bytes.Length))
+                    bool bytesWritten;
+                    lock (this.conptyInputWriteLock)
+                    {
+                        bytesWritten = WriteAll(this.conptyInWrite, bytes, bytes.Length);
+                    }
+                    if (!bytesWritten)
                     {
                         return;
                     }
@@ -865,7 +1007,10 @@ internal sealed class RowPty
 
             byte[] hostOutput = null;
             int hostOutputCount = read;
-            if (this.preserveScrollback)
+            // The DA1 probe arrives in the first chunks after startup; keep the
+            // CSI rewriter engaged until it has been answered even when both
+            // scrollback filters are disabled.
+            if (this.preserveScrollback || this.filterAlternateScreen || !this.da1QueryAnswered)
             {
                 hostOutput = FilterHostOutput(buffer, read);
                 hostOutputCount = hostOutput.Length;
@@ -877,7 +1022,12 @@ internal sealed class RowPty
 
             lock (this.consoleLock)
             {
-                if (hostOutputCount > 0 && !WriteAll(this.hStdOut, hostOutput, hostOutputCount))
+                if (hostOutputCount > 0)
+                {
+                    ClearPaintedStatusRowBeforeChildOutput();
+                }
+
+                if (hostOutputCount > 0 && !WriteHostOutput(hostOutput, hostOutputCount))
                 {
                     break;
                 }
@@ -1095,13 +1245,49 @@ internal sealed class RowPty
             {
                 WriteStatusRowPayload("\u001b[0m\r\u001b[1G" + line + "\u001b[K\u001b[0m");
             }
+
+            this.lastPaintedLine = line;
+            this.lastPaintedRow = row;
+            this.paintedStatusVersion = version;
+            this.lastPaintMs = this.clock.ElapsedMilliseconds;
         }
 
-        this.lastPaintedLine = line;
-        this.lastPaintedRow = row;
-        this.paintedStatusVersion = version;
-        this.lastPaintMs = this.clock.ElapsedMilliseconds;
         return true;
+    }
+
+    private void ClearStaleStatusRow(int previousRow)
+    {
+        if (previousRow < 1 || previousRow == this.currentRows)
+        {
+            this.lastPaintedLine = null;
+            return;
+        }
+
+        this.lastPaintedLine = null;
+        this.lastPaintedRow = -1;
+        if (previousRow > this.currentRows)
+        {
+            return;
+        }
+
+        lock (this.consoleLock)
+        {
+            WriteConsoleRowPayload(previousRow, "\u001b[0m\r\u001b[1G\u001b[2K\u001b[0m");
+        }
+    }
+
+    private void ClearPaintedStatusRowBeforeChildOutput()
+    {
+        if (this.hostScrollRegionConfigured || this.lastPaintedRow < 1)
+        {
+            return;
+        }
+
+        int row = this.lastPaintedRow;
+        this.lastPaintedLine = null;
+        this.lastPaintedRow = -1;
+        this.paintedStatusVersion = -1;
+        WriteConsoleRowPayload(row, "\u001b[0m\r\u001b[1G\u001b[2K\u001b[0m");
     }
 
     private static bool HostScrollRegionEnabled()
@@ -1159,7 +1345,7 @@ internal sealed class RowPty
         return WriteAll(this.hStdOut, bytes, bytes.Length);
     }
 
-    private bool WriteStatusRowPayload(string payload)
+    private bool WriteConsoleRowPayload(int targetRow, string payload)
     {
         // Paint the reserved bottom row, then move the cursor back to wherever
         // the child left it -- all in ONE write. We already hold consoleLock,
@@ -1174,6 +1360,11 @@ internal sealed class RowPty
         // moves into one write keeps the cursor off the status row (no flicker
         // the way two SetConsoleCursorPosition calls produced).
         char esc = (char)27;
+        if (targetRow < 1 || targetRow > this.currentRows)
+        {
+            return true;
+        }
+
         CONSOLE_SCREEN_BUFFER_INFO info;
         if (GetConsoleScreenBufferInfo(this.hStdOut, out info))
         {
@@ -1195,7 +1386,7 @@ internal sealed class RowPty
             {
                 savedCol = this.currentCols;
             }
-            string framed = esc + "[" + this.currentRows.ToString(CultureInfo.InvariantCulture) + ";1H"
+            string framed = esc + "[" + targetRow.ToString(CultureInfo.InvariantCulture) + ";1H"
                 + payload
                 + esc + "[" + savedRow.ToString(CultureInfo.InvariantCulture) + ";" + savedCol.ToString(CultureInfo.InvariantCulture) + "H";
             byte[] bytes = Encoding.UTF8.GetBytes(framed);
@@ -1203,9 +1394,14 @@ internal sealed class RowPty
         }
 
         // Fallback when the cursor position is unavailable: pure VT DECSC/DECRC.
-        string fallback = esc + "7" + esc + "[" + this.currentRows.ToString(CultureInfo.InvariantCulture) + ";1H" + payload + esc + "8";
+        string fallback = esc + "7" + esc + "[" + targetRow.ToString(CultureInfo.InvariantCulture) + ";1H" + payload + esc + "8";
         byte[] fallbackBytes = Encoding.UTF8.GetBytes(fallback);
         return WriteAll(this.hStdOut, fallbackBytes, fallbackBytes.Length);
+    }
+
+    private bool WriteStatusRowPayload(string payload)
+    {
+        return WriteConsoleRowPayload(this.currentRows, payload);
     }
 
     private static string FitStatusLine(string text, int width)
@@ -1526,6 +1722,18 @@ internal sealed class RowPty
         return !(value == "0" || value == "false" || value == "no" || value == "off");
     }
 
+    private static bool FilterAlternateScreenEnabled()
+    {
+        string value = Environment.GetEnvironmentVariable("ROWPTY_FILTER_ALT_SCREEN");
+        if (value == null || value.Length == 0)
+        {
+            return false;
+        }
+
+        value = value.Trim().ToLowerInvariant();
+        return value == "1" || value == "true" || value == "yes" || value == "on";
+    }
+
     private byte[] FilterHostOutput(byte[] buffer, int count)
     {
         byte[] input;
@@ -1609,21 +1817,75 @@ internal sealed class RowPty
         return output.ToArray();
     }
 
-    private static byte[] RewriteHostCsi(byte[] buffer, int parameterStart, int parameterEnd, int finalIndex, byte final)
+    private byte[] RewriteHostCsi(byte[] buffer, int parameterStart, int parameterEnd, int finalIndex, byte final)
     {
-        if (final == (byte)'J' && CsiParamsContain(buffer, parameterStart, parameterEnd, 3))
+        if (IsDa1Query(buffer, parameterStart, parameterEnd, finalIndex, final))
         {
+            AnswerDa1Query();
             return new byte[0];
         }
 
-        if ((final == (byte)'h' || final == (byte)'l') &&
+        if (this.preserveScrollback && final == (byte)'J')
+        {
+            if (CsiParamsContain(buffer, parameterStart, parameterEnd, 3))
+            {
+                return new byte[0];
+            }
+            if (CsiParamsContain(buffer, parameterStart, parameterEnd, 2))
+            {
+                return HostClearDisplayAction;
+            }
+            if (CsiParamsEmpty(buffer, parameterStart, parameterEnd) || CsiParamsContain(buffer, parameterStart, parameterEnd, 0))
+            {
+                return HostClearFromCursorAction;
+            }
+        }
+
+        if (this.filterAlternateScreen &&
+            (final == (byte)'h' || final == (byte)'l') &&
             parameterStart < parameterEnd &&
             buffer[parameterStart] == (byte)'?')
         {
             return RewritePrivateModeCsi(buffer, parameterStart, parameterEnd, finalIndex, final);
         }
 
+        if ((final == (byte)'H' || final == (byte)'f' || final == (byte)'d') && parameterEnd == finalIndex)
+        {
+            return ClampCursorRowCsi(buffer, parameterStart, parameterEnd, final);
+        }
+
         return null;
+    }
+
+    private byte[] ClampCursorRowCsi(byte[] buffer, int parameterStart, int parameterEnd, byte final)
+    {
+        // The passthrough ConPTY forwards absolute cursor rows verbatim, but
+        // the child screen is --reserve rows shorter than the host console, so
+        // an unclamped row (the common ESC[999;1H bottom-of-screen idiom) would
+        // land on the reserved status row. The in-box conhost used to clamp
+        // this while re-rendering; do the same here.
+        if (parameterStart >= parameterEnd)
+        {
+            return null;
+        }
+        byte first = buffer[parameterStart];
+        if (!((first >= (byte)'0' && first <= (byte)'9') || first == (byte)';'))
+        {
+            return null;
+        }
+
+        int maxRow = ChildRows(this.currentRows);
+        string parameters = Encoding.ASCII.GetString(buffer, parameterStart, parameterEnd - parameterStart);
+        string[] parts = parameters.Split(';');
+        int row;
+        if (parts[0].Length == 0 || !int.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out row) || row <= maxRow)
+        {
+            return null;
+        }
+
+        parts[0] = maxRow.ToString(CultureInfo.InvariantCulture);
+        string rewritten = "\x1b[" + string.Join(";", parts) + ((char)final);
+        return Encoding.ASCII.GetBytes(rewritten);
     }
 
     private static byte[] RewritePrivateModeCsi(byte[] buffer, int parameterStart, int parameterEnd, int finalIndex, byte final)
@@ -1707,6 +1969,48 @@ internal sealed class RowPty
             }
         }
         return false;
+    }
+
+    private static bool IsDa1Query(byte[] buffer, int parameterStart, int parameterEnd, int finalIndex, byte final)
+    {
+        // Plain ESC[c or ESC[0c only. DA2 (ESC[>c) and DA1 responses
+        // (ESC[?...c) carry prefix parameter bytes and must pass through.
+        if (final != (byte)'c' || parameterEnd != finalIndex)
+        {
+            return false;
+        }
+        if (parameterStart == parameterEnd)
+        {
+            return true;
+        }
+        return (parameterEnd - parameterStart) == 1 && buffer[parameterStart] == (byte)'0';
+    }
+
+    private void AnswerDa1Query()
+    {
+        this.da1QueryAnswered = true;
+        if (this.conptyInWrite == IntPtr.Zero)
+        {
+            return;
+        }
+        lock (this.conptyInputWriteLock)
+        {
+            WriteAll(this.conptyInWrite, Da1Response, Da1Response.Length);
+        }
+    }
+
+    private static bool CsiParamsEmpty(byte[] buffer, int start, int end)
+    {
+        int i;
+        for (i = start; i < end; i++)
+        {
+            byte b = buffer[i];
+            if (b >= (byte)'0' && b <= (byte)'9')
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static void AppendBytes(System.Collections.Generic.List<byte> output, byte[] input, int offset, int count)
@@ -1963,6 +2267,134 @@ internal sealed class RowPty
             return true;
         }
         return nowMs - this.outputVtStateChangedMs >= 2000;
+    }
+
+    private bool WriteHostOutput(byte[] buffer, int count)
+    {
+        int offset = 0;
+        while (offset < count)
+        {
+            int displayClear = IndexOfBytes(buffer, offset, count, HostClearDisplayAction);
+            int cursorClear = IndexOfBytes(buffer, offset, count, HostClearFromCursorAction);
+            int marker = -1;
+            byte[] action = null;
+            if (displayClear >= 0 && (cursorClear < 0 || displayClear < cursorClear))
+            {
+                marker = displayClear;
+                action = HostClearDisplayAction;
+            }
+            else if (cursorClear >= 0)
+            {
+                marker = cursorClear;
+                action = HostClearFromCursorAction;
+            }
+
+            if (marker < 0)
+            {
+                return WriteSlice(this.hStdOut, buffer, offset, count - offset);
+            }
+
+            if (marker > offset && !WriteSlice(this.hStdOut, buffer, offset, marker - offset))
+            {
+                return false;
+            }
+
+            if (action == HostClearDisplayAction)
+            {
+                ClearVisibleConsoleWindow();
+            }
+            else
+            {
+                ClearConsoleFromCursorToBottom();
+            }
+            offset = marker + action.Length;
+        }
+        return true;
+    }
+
+    private static int IndexOfBytes(byte[] buffer, int offset, int count, byte[] needle)
+    {
+        int end = count - needle.Length;
+        int i;
+        for (i = offset; i <= end; i++)
+        {
+            int j;
+            for (j = 0; j < needle.Length; j++)
+            {
+                if (buffer[i + j] != needle[j])
+                {
+                    break;
+                }
+            }
+            if (j == needle.Length)
+            {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static bool WriteSlice(IntPtr handle, byte[] buffer, int offset, int count)
+    {
+        if (count <= 0)
+        {
+            return true;
+        }
+        byte[] slice = new byte[count];
+        Buffer.BlockCopy(buffer, offset, slice, 0, count);
+        return WriteAll(handle, slice, count);
+    }
+
+    private bool ClearVisibleConsoleWindow()
+    {
+        CONSOLE_SCREEN_BUFFER_INFO info;
+        if (!GetConsoleScreenBufferInfo(this.hStdOut, out info))
+        {
+            return false;
+        }
+
+        int width = Math.Max(1, info.srWindow.Right - info.srWindow.Left + 1);
+        short y;
+        for (y = info.srWindow.Top; y <= info.srWindow.Bottom; y++)
+        {
+            ClearConsoleRange(info, info.srWindow.Left, y, width);
+        }
+        return true;
+    }
+
+    private bool ClearConsoleFromCursorToBottom()
+    {
+        CONSOLE_SCREEN_BUFFER_INFO info;
+        if (!GetConsoleScreenBufferInfo(this.hStdOut, out info))
+        {
+            return false;
+        }
+
+        int left = info.srWindow.Left;
+        int right = info.srWindow.Right;
+        int width = Math.Max(1, right - left + 1);
+        int cursorX = Math.Max(left, Math.Min(right, info.dwCursorPosition.X));
+        int cursorY = Math.Max(info.srWindow.Top, Math.Min(info.srWindow.Bottom, info.dwCursorPosition.Y));
+
+        ClearConsoleRange(info, (short)cursorX, (short)cursorY, right - cursorX + 1);
+        short y;
+        for (y = (short)(cursorY + 1); y <= info.srWindow.Bottom; y++)
+        {
+            ClearConsoleRange(info, (short)left, y, width);
+        }
+        return true;
+    }
+
+    private bool ClearConsoleRange(CONSOLE_SCREEN_BUFFER_INFO info, short x, short y, int length)
+    {
+        COORD origin = new COORD();
+        origin.X = x;
+        origin.Y = y;
+        uint written;
+        bool ok = FillConsoleOutputCharacterW(this.hStdOut, ' ', (uint)Math.Max(0, length), origin, out written);
+        uint attrWritten;
+        FillConsoleOutputAttribute(this.hStdOut, (ushort)info.wAttributes, (uint)Math.Max(0, length), origin, out attrWritten);
+        return ok;
     }
 
     private static bool WriteAll(IntPtr handle, byte[] buffer, int count)
@@ -2276,6 +2708,12 @@ internal sealed class RowPty
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetConsoleCursorPosition(IntPtr hConsoleOutput, COORD dwCursorPosition);
 
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool FillConsoleOutputCharacterW(IntPtr hConsoleOutput, char cCharacter, uint nLength, COORD dwWriteCoord, out uint lpNumberOfCharsWritten);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FillConsoleOutputAttribute(IntPtr hConsoleOutput, ushort wAttribute, uint nLength, COORD dwWriteCoord, out uint lpNumberOfAttrsWritten);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CreatePipe(out IntPtr hReadPipe, out IntPtr hWritePipe, IntPtr lpPipeAttributes, int nSize);
 
@@ -2290,6 +2728,18 @@ internal sealed class RowPty
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
     private static extern short VkKeyScanW(char ch);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int GetWindowTextLengthW(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);

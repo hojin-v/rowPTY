@@ -66,6 +66,8 @@ rowpty.exe [options] -- CHILD.exe [ARGS...]
 | `--status-cmd CMD` | 없음 | 상태 텍스트를 출력하는 전체 명령줄. 실행 전 `{MAXWIDTH}`가 `cols - 4`로 치환됩니다 |
 | `--settle-ms N` | 50 | 자식 출력이 잠잠해진 후 상태줄을 그리기까지의 대기 시간 |
 | `--version` / `--help` | | |
+| `--foreground-terminal` | Print the active supported terminal as `HWND<TAB>BASE64_TITLE`, or `0<TAB>`. This does not initialize ConPTY. | |
+| `--launch-detached COMMAND_BASE64 CWD_BASE64 [WINDOW_PLACEHOLDER]` | Start a hidden process outside the caller's Job Object; intended for lightweight host integrations. | |
 
 종료 코드: 자식의 종료 코드를 그대로 반환. 사용법 오류 또는 stdin/stdout이 실제 콘솔이 아니면 `2`.
 

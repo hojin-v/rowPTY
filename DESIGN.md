@@ -46,7 +46,12 @@ rowpty.exe [options] -- CHILD.exe [ARGS...]
                      status row shows nothing (still reserved).
 --settle-ms N        quiet time after child output before painting (default 50)
 --version / --help
+--launch-detached COMMAND_BASE64 CWD_BASE64 [WINDOW_PLACEHOLDER]
 ```
+
+`--foreground-terminal` is a one-shot Win32 query for integrations that need
+to follow a terminal tab between top-level windows. It does not initialize a
+console or ConPTY.
 
 Exit codes: child's exit code; 2 for usage errors or when stdin/stdout is not a
 real console.
@@ -111,6 +116,29 @@ child process attached to the ConPTY, believes terminal is rows-N tall
    + `CreateProcess(NULL, cmdline, ..., EXTENDED_STARTUPINFO_PRESENT, NULL env,
    cwd = current, &siEx, &pi)`. STARTUPINFO.cb = sizeof(STARTUPINFOEX);
    do NOT set STARTF_USESTDHANDLES.
+
+### DA1 startup probe: answered locally
+
+conpty.dll (>= 1.22) probes the hosting terminal with DA1 (`ESC[c`) at startup
+and blocks in `WaitUntilDA1(3000)` until a response arrives. InputPump
+deliberately drops terminal responses coming back from the real host (see
+TryDropTerminalResponse), so the probe would always time out — a flat 3 s
+startup stall (measured 3.1–3.3 s; this is what previously pushed ai-battery
+to default to the OS ConPTY, whose re-rendering corrupts Codex scroll-region
+output). rowpty therefore answers the probe itself: the output filter detects
+plain `ESC[c` / `ESC[0c`, swallows it, and writes a canned DA1 response
+(`ESC[?61;6;7;14;21;22;23;24;28;32;42c`) to the ConPTY input pipe, serialized
+with InputPump writes via a shared lock. Measured startup drops to ~130 ms.
+
+### Absolute cursor row clamping
+
+The passthrough ConPTY forwards the client's absolute cursor rows verbatim,
+but the child screen is `--reserve` rows shorter than the host console, so an
+unclamped row — the `ESC[999;1H` bottom-of-screen idiom — would land on the
+reserved status row (the in-box conhost used to clamp it while re-rendering).
+The output filter clamps the row parameter of CUP/HVP/VPA (`H`/`f`/`d`) to
+the child height. Rows the client can legitimately address (1..rows-N) pass
+through untouched.
 
 ### Input: win32-input-mode forwarding (NOT a byte pump)
 
